@@ -17,6 +17,7 @@
 #include <xen/hvm/ioreq.h>
 
 extern MemoryRegion ram_memory;
+extern MemoryRegion *ram_grants;
 extern MemoryListener xen_io_listener;
 extern DeviceListener xen_device_listener;
 
