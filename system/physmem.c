@@ -2337,11 +2337,6 @@ RAMBlock *qemu_ram_alloc_from_fd(ram_addr_t size, ram_addr_t max_size,
                           RAM_RESIZEABLE)) == 0);
     assert(max_size >= size);
 
-    if (xen_enabled()) {
-        error_setg(errp, "-mem-path not supported with Xen");
-        return NULL;
-    }
-
     if (kvm_enabled() && !kvm_has_sync_mmu()) {
         error_setg(errp,
                    "host lacks kvm mmu notifiers, -mem-path unsupported");
