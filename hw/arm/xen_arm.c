@@ -148,9 +148,6 @@ static void xen_init_ram(MachineState *machine)
                                  GUEST_RAM1_BASE, ram_size[1]);
         memory_region_add_subregion(sysmem, GUEST_RAM1_BASE, &ram_hi);
     }
-
-    /* Add grant mappings as a pseudo RAM region. */
-    ram_grants = xen_init_grant_ram();
 }
 
 static void xen_create_pcie(XenArmState *xam)
