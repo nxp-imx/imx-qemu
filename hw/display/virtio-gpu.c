@@ -1571,7 +1571,7 @@ void virtio_gpu_reset(VirtIODevice *vdev)
             qemu_cond_wait_iothread(&g->reset_cond);
         }
     } else {
-        virtio_gpu_reset_bh(g);
+        aio_bh_call(g->reset_bh);
     }
 
     while (!QTAILQ_EMPTY(&g->cmdq)) {
