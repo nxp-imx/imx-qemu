@@ -12,7 +12,7 @@ extern MemoryRegion xen_grants;
 extern MemoryListener xen_io_listener;
 extern DeviceListener xen_device_listener;
 
-//#define DEBUG_XEN_HVM
+#define DEBUG_XEN_HVM
 
 #ifdef DEBUG_XEN_HVM
 #define DPRINTF(fmt, ...) \
