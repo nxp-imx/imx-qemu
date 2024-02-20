@@ -30,7 +30,7 @@
 #include "hw/virtio/virtio.h"
 #include "exec/address-spaces.h"
 
-/* #define DEBUG_VIRTIO_BUS */
+#define DEBUG_VIRTIO_BUS
 
 #ifdef DEBUG_VIRTIO_BUS
 #define DPRINTF(fmt, ...) \
