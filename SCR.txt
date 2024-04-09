@@ -1,0 +1,13 @@
+--------------------------------------------
+
+Package:                     imx-qemu.git
+Version:                     8.2.2
+Outgoing License:            GPL-2.0
+License File:                COPYING
+Package Category:            BSP
+Type of Content:             source
+Description and comments:    A Virtual Machine Emulator
+Release Location:            https://github.com/nxp-imx/imx-qemu -b lf-6.6.3-1.0.0
+Origin:                      NXP (GPL-2.0)
+
+--------------------------------------------
