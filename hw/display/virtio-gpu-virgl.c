@@ -951,6 +951,7 @@ static struct virgl_renderer_callbacks virtio_gpu_3d_cbs_egl = {
     .create_gl_context   = virgl_create_context,
     .destroy_gl_context  = virgl_destroy_context,
     .make_current        = virgl_make_context_current,
+    .get_egl_display     = TMP_virgl_get_egl_display,
 };
 
 static void virtio_gpu_print_stats(void *opaque)
