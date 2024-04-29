@@ -25,7 +25,7 @@
 
 #include <virglrenderer.h>
 
-static bool use_async_cb = true;
+static bool use_async_cb = false;
 static bool use_per_ctx_fence = true;
 static struct virgl_renderer_callbacks virtio_gpu_3d_cbs;
 static struct virgl_renderer_callbacks virtio_gpu_3d_cbs_egl;
