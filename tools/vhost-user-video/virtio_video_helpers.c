@@ -14,6 +14,7 @@
  * See the COPYING file in the top-level directory.
  */
 
+#include "qemu/osdep.h"
 #include <assert.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -33,7 +34,9 @@ struct virtio_video_convert_table {
     uint32_t v4l2_value;
 };
 
+#ifndef ARRAY_SIZE
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
 
 static struct virtio_video_convert_table level_table[] = {
     { VIRTIO_VIDEO_LEVEL_H264_1_0, V4L2_MPEG_VIDEO_H264_LEVEL_1_0 },
