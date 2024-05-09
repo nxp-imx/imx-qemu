@@ -14,6 +14,7 @@
 #define G_LOG_DOMAIN "vhost-user-video"
 #define G_LOG_USE_STRUCTURED 1
 
+#include "qemu/osdep.h"
 #include <glib.h>
 #include <gio/gio.h>
 #include <gio/gunixsocketaddress.h>
