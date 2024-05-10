@@ -116,6 +116,7 @@ static const QDevAlias qdev_alias_table[] = {
     { "virtio-tablet-device", "virtio-tablet", QEMU_ARCH_VIRTIO_MMIO },
     { "virtio-tablet-ccw", "virtio-tablet", QEMU_ARCH_VIRTIO_CCW },
     { "virtio-tablet-pci", "virtio-tablet", QEMU_ARCH_VIRTIO_PCI },
+    { "vhost-user-video-pci", "virtio-video", QEMU_ARCH_VIRTIO_PCI },
     { }
 };
 
