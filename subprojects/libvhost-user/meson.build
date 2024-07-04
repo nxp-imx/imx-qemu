@@ -19,6 +19,16 @@ vhost_user = static_library('vhost-user',
 executable('link-test', files('link-test.c'),
            link_whole: vhost_user)
 
+xencontrol = dependency('xencontrol', required: true)
+xenforeign = dependency('xenforeignmemory', required: true)
+
+vhost_user_xen = static_library('vhost-user-xen',
+                                files('libvhost-user-xen.c'),
+                                link_with: vhost_user,
+                                dependencies: xencontrol,
+                                dependencies: xenforeign,
+                                dependencies: glib)
+
 vhost_user_glib = static_library('vhost-user-glib',
                                  files('libvhost-user-glib.c'),
                                  link_with: vhost_user,
