@@ -38,6 +38,15 @@
 
 #define VHOST_USER_HDR_SIZE offsetof(VhostUserMsg, payload.u64)
 
+#define LIBVHOST_USER_DEBUG 0
+
+#define DPRINT(...)                             \
+    do {                                        \
+        if (LIBVHOST_USER_DEBUG) {              \
+            fprintf(stderr, __VA_ARGS__);        \
+        }                                       \
+    } while (0)
+
 typedef enum VhostSetConfigType {
     VHOST_SET_CONFIG_TYPE_FRONTEND = 0,
     VHOST_SET_CONFIG_TYPE_MIGRATION = 1,
@@ -755,5 +764,4 @@ void vu_queue_get_avail_bytes(VuDev *vdev, VuVirtq *vq, unsigned int *in_bytes,
  */
 bool vu_queue_avail_bytes(VuDev *dev, VuVirtq *vq, unsigned int in_bytes,
                           unsigned int out_bytes);
-
 #endif /* LIBVHOST_USER_H */

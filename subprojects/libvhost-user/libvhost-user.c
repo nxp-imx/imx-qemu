@@ -92,14 +92,6 @@
 
 /* The version of the protocol we support */
 #define VHOST_USER_VERSION 1
-#define LIBVHOST_USER_DEBUG 0
-
-#define DPRINT(...)                             \
-    do {                                        \
-        if (LIBVHOST_USER_DEBUG) {              \
-            fprintf(stderr, __VA_ARGS__);        \
-        }                                       \
-    } while (0)
 
 static inline
 bool has_feature(uint64_t features, unsigned int fbit)
