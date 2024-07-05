@@ -686,6 +686,7 @@ static void *xen_map_grant_dyn(MemoryRegion **mr, hwaddr addr, hwaddr *plen,
             mgr = NULL;
         }
     } else {
+        refs = NULL;
         mgr->refs++;
     }
 
