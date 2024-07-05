@@ -24,6 +24,7 @@
 #include "sysemu/xen-mapcache.h"
 #include "trace.h"
 
+#include <xengnttab.h>
 
 //#define MAPCACHE_DEBUG
 
