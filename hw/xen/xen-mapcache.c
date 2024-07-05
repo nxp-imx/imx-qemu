@@ -24,6 +24,7 @@
 #include "sysemu/xen-mapcache.h"
 #include "trace.h"
 
+#include <xengnttab.h>
 
 #if HOST_LONG_BITS == 32
 #  define MCACHE_BUCKET_SHIFT 16
