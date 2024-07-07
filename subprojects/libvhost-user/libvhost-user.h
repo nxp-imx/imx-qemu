@@ -14,6 +14,7 @@
 #ifndef LIBVHOST_USER_H
 #define LIBVHOST_USER_H
 
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -40,7 +41,7 @@
 
 #define VHOST_USER_HDR_SIZE offsetof(VhostUserMsg, payload.u64)
 
-#define LIBVHOST_USER_DEBUG 0
+#define LIBVHOST_USER_DEBUG 1
 
 #define DPRINT(...)                             \
     do {                                        \
@@ -123,6 +124,7 @@ typedef enum VhostUserRequest {
     VHOST_USER_ADD_MEM_REG = 37,
     VHOST_USER_REM_MEM_REG = 38,
     VHOST_USER_GET_SHARED_OBJECT = 41,
+    VHOST_USER_XEN_ADD_MEM_REG = 44,
     VHOST_USER_MAX
 } VhostUserRequest;
 
@@ -158,6 +160,12 @@ typedef struct VhostUserMemRegMsg {
     uint64_t padding;
     VhostUserMemoryRegion region;
 } VhostUserMemRegMsg;
+
+typedef struct VhostUserXenMemRegMsg{
+    uint32_t xen_domainid;
+    uint32_t padding;
+    VhostUserMemoryRegion region;
+} VhostUserXenMemRegMsg;
 
 typedef struct VhostUserLog {
     uint64_t mmap_size;
@@ -223,6 +231,7 @@ typedef struct VhostUserMsg {
         VhostUserVringArea area;
         VhostUserInflight inflight;
         VhostUserShared object;
+        VhostUserXenMemRegMsg xenmemreg;
     } payload;
 
     int fds[VHOST_MEMORY_BASELINE_NREGIONS];
@@ -241,6 +250,8 @@ typedef struct VuDevRegion {
     uint64_t mmap_offset;
     /* Start address of mmaped space. */
     uint64_t mmap_addr;
+    /* Xen: Vhost virtual address (userspace). */
+    uint64_t vva;
 } VuDevRegion;
 
 typedef struct VuDev VuDev;
@@ -460,6 +471,9 @@ struct VuDev {
     /* Postcopy data */
     int postcopy_ufd;
     bool postcopy_listening;
+
+    /* Xen specific */
+    uint32_t xen_domainid;
 };
 
 typedef struct VuVirtqElement {
@@ -766,4 +780,6 @@ void vu_queue_get_avail_bytes(VuDev *vdev, VuVirtq *vq, unsigned int *in_bytes,
  */
 bool vu_queue_avail_bytes(VuDev *dev, VuVirtq *vq, unsigned int in_bytes,
                           unsigned int out_bytes);
+
+bool map_ring(VuDev *dev, VuVirtq *vq);
 #endif /* LIBVHOST_USER_H */

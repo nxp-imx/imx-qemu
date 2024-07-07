@@ -3200,7 +3200,7 @@ config_host_data.set('CONFIG_FDT', fdt.found())
 
 vhost_user = not_found
 if host_os == 'linux' and have_vhost_user
-  libvhost_user = subproject('libvhost-user')
+  libvhost_user = subproject('libvhost-user', default_options: 'xen=disabled')
   vhost_user = libvhost_user.get_variable('vhost_user_dep')
 endif
 
