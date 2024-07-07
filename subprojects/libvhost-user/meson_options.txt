@@ -1,0 +1,2 @@
+option('xen', type: 'feature', value: 'disabled',
+       description: 'Xen libvhost-user support')

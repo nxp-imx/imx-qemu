@@ -53,6 +53,7 @@
 #include "include/atomic.h"
 
 #include "libvhost-user.h"
+#include "libvhost-user-xen.h"
 
 /* usually provided by GLib */
 #if     __GNUC__ > 2 || (__GNUC__ == 2 && __GNUC_MINOR__ > 4)
@@ -154,6 +155,7 @@ vu_request_to_string(unsigned int req)
         REQ(VHOST_USER_ADD_MEM_REG),
         REQ(VHOST_USER_REM_MEM_REG),
         REQ(VHOST_USER_GET_SHARED_OBJECT),
+        REQ(VHOST_USER_XEN_ADD_MEM_REG),
         REQ(VHOST_USER_MAX),
     };
 #undef REQ
@@ -604,12 +606,19 @@ vu_reset_device_exec(VuDev *dev, VhostUserMsg *vmsg)
     return false;
 }
 
-static bool
+bool
 map_ring(VuDev *dev, VuVirtq *vq)
 {
-    vq->vring.desc = qva_to_va(dev, vq->vra.desc_user_addr);
-    vq->vring.used = qva_to_va(dev, vq->vra.used_user_addr);
-    vq->vring.avail = qva_to_va(dev, vq->vra.avail_user_addr);
+    if(!dev->xen_domainid) {
+        vq->vring.desc = qva_to_va(dev, vq->vra.desc_user_addr);
+        vq->vring.used = qva_to_va(dev, vq->vra.used_user_addr);
+        vq->vring.avail = qva_to_va(dev, vq->vra.avail_user_addr);
+    } else {
+        uint64_t len = 1;
+        vq->vring.desc = vu_gpa_to_va(dev, &len, vq->vra.desc_user_addr);
+        vq->vring.used = vu_gpa_to_va(dev, &len, vq->vra.used_user_addr);
+        vq->vring.avail = vu_gpa_to_va(dev, &len, vq->vra.avail_user_addr);
+    }
 
     DPRINT("Setting virtq addresses:\n");
     DPRINT("    vring_desc  at %p\n", vq->vring.desc);
@@ -2052,6 +2061,8 @@ vu_process_message(VuDev *dev, VhostUserMsg *vmsg)
         return vu_handle_get_max_memslots(dev, vmsg);
     case VHOST_USER_ADD_MEM_REG:
         return vu_add_mem_reg(dev, vmsg);
+    case VHOST_USER_XEN_ADD_MEM_REG:
+        return vu_xen_add_mem_reg(dev, vmsg);
     case VHOST_USER_REM_MEM_REG:
         return vu_rem_mem_reg(dev, vmsg);
     case VHOST_USER_GET_SHARED_OBJECT:

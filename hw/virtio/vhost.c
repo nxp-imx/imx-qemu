@@ -27,6 +27,7 @@
 #include "migration/blocker.h"
 #include "migration/qemu-file-types.h"
 #include "sysemu/dma.h"
+#include "sysemu/xen.h"
 #include "trace.h"
 
 /* enabled until disconnected backend stabilizes */
@@ -526,6 +527,11 @@ static bool vhost_section(struct vhost_dev *dev, MemoryRegionSection *section)
             return false;
         }
 
+        if (xen_enabled()) {
+            trace_vhost_section(mr->name);
+            return true;
+        }
+
         /*
          * Some backends (like vhost-user) can only handle memory regions
          * that have an fd (can be mapped into a different process). Filter
@@ -904,9 +910,16 @@ static int vhost_virtqueue_set_addr(struct vhost_dev *dev,
             return r;
         }
     } else {
-        addr.desc_user_addr = (uint64_t)(unsigned long)vq->desc;
-        addr.avail_user_addr = (uint64_t)(unsigned long)vq->avail;
-        addr.used_user_addr = (uint64_t)(unsigned long)vq->used;
+        if(!xen_enabled()) {
+            addr.desc_user_addr = (uint64_t)(unsigned long)vq->desc;
+            addr.avail_user_addr = (uint64_t)(unsigned long)vq->avail;
+            addr.used_user_addr = (uint64_t)(unsigned long)vq->used;
+        } else {
+            addr.desc_user_addr = (uint64_t)(unsigned long)vq->desc_phys;
+            addr.avail_user_addr = (uint64_t)(unsigned long)vq->avail_phys;
+            addr.used_user_addr = (uint64_t)(unsigned long)vq->used_phys;
+        }
+
     }
     addr.index = idx;
     addr.log_guest_addr = vq->used_phys;

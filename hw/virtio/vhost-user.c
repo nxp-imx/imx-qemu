@@ -17,6 +17,7 @@
 #include "hw/virtio/vhost-backend.h"
 #include "hw/virtio/virtio.h"
 #include "hw/virtio/virtio-net.h"
+#include "hw/xen/xen.h"
 #include "chardev/char-fe.h"
 #include "io/channel-socket.h"
 #include "sysemu/kvm.h"
@@ -26,6 +27,7 @@
 #include "qemu/sockets.h"
 #include "sysemu/runstate.h"
 #include "sysemu/cryptodev.h"
+#include "sysemu/xen.h"
 #include "migration/migration.h"
 #include "migration/postcopy-ram.h"
 #include "trace.h"
@@ -105,6 +107,7 @@ typedef enum VhostUserRequest {
     VHOST_USER_GET_SHARED_OBJECT = 41,
     VHOST_USER_SET_DEVICE_STATE_FD = 42,
     VHOST_USER_CHECK_DEVICE_STATE = 43,
+    VHOST_USER_XEN_ADD_MEM_REG = 44,
     VHOST_USER_MAX
 } VhostUserRequest;
 
@@ -136,6 +139,12 @@ typedef struct VhostUserMemRegMsg {
     uint64_t padding;
     VhostUserMemoryRegion region;
 } VhostUserMemRegMsg;
+
+typedef struct VhostUserXenMemRegMsg{
+    uint32_t xen_domainid;
+    uint32_t padding;
+    VhostUserMemoryRegion region;
+} VhostUserXenMemRegMsg;
 
 typedef struct VhostUserLog {
     uint64_t mmap_size;
@@ -225,6 +234,7 @@ typedef union {
         VhostUserInflight inflight;
         VhostUserShared object;
         VhostUserTransferDeviceState transfer_state;
+        VhostUserXenMemRegMsg xenmemreg;
 } VhostUserPayload;
 
 typedef struct VhostUserMsg {
@@ -635,10 +645,14 @@ static void scrub_shadow_regions(struct vhost_dev *dev,
      */
     for (i = 0; i < dev->mem->nregions; i++) {
         reg = &dev->mem->regions[i];
-        vhost_user_get_mr_data(reg->userspace_addr, &offset, &fd);
-        if (fd > 0) {
-            ++fd_num;
-        }
+	if (xen_enabled()) {
+		++fd_num;
+	} else {
+		vhost_user_get_mr_data(reg->userspace_addr, &offset, &fd);
+		if (fd > 0) {
+			++fd_num;
+		}
+	}
 
         /*
          * If the region was in both the shadow and device state we don't
@@ -721,7 +735,7 @@ static int send_add_regions(struct vhost_dev *dev,
     int i, fd, ret, reg_idx, reg_fd_idx;
     struct vhost_memory_region *reg;
     MemoryRegion *mr;
-    ram_addr_t offset;
+    ram_addr_t offset = 1;
     VhostUserMsg msg_reply;
     VhostUserMemoryRegion region_buffer;
 
@@ -730,82 +744,101 @@ static int send_add_regions(struct vhost_dev *dev,
         reg_idx = add_reg[i].reg_idx;
         reg_fd_idx = add_reg[i].fd_idx;
 
-        mr = vhost_user_get_mr_data(reg->userspace_addr, &offset, &fd);
-
-        if (fd > 0) {
-            if (track_ramblocks) {
-                trace_vhost_user_set_mem_table_withfd(reg_fd_idx, mr->name,
-                                                      reg->memory_size,
-                                                      reg->guest_phys_addr,
-                                                      reg->userspace_addr,
-                                                      offset);
-                u->region_rb_offset[reg_idx] = offset;
-                u->region_rb[reg_idx] = mr->ram_block;
-            }
-            msg->hdr.request = VHOST_USER_ADD_MEM_REG;
+        if (xen_enabled()) {
+            msg->hdr.request = VHOST_USER_XEN_ADD_MEM_REG;
+            msg->hdr.flags = VHOST_USER_VERSION,
+            msg->hdr.size = sizeof(msg->payload.xenmemreg);
+	    /* offset check? */
+	    offset = 0;
             vhost_user_fill_msg_region(&region_buffer, reg, offset);
-            msg->payload.mem_reg.region = region_buffer;
+            msg->payload.xenmemreg.region = region_buffer;
+	    msg->payload.xenmemreg.xen_domainid = xen_domid;
 
-            ret = vhost_user_write(dev, msg, &fd, 1);
+            ret = vhost_user_write(dev, msg, NULL, 0);
             if (ret < 0) {
                 return ret;
             }
 
-            if (track_ramblocks) {
-                uint64_t reply_gpa;
+            if (reply_supported) {
+                /* Not supported */
+            }
 
-                ret = vhost_user_read(dev, &msg_reply);
+	} else {
+            mr = vhost_user_get_mr_data(reg->userspace_addr, &offset, &fd);
+            if (fd > 0) {
+                if (track_ramblocks) {
+                    trace_vhost_user_set_mem_table_withfd(reg_fd_idx, mr->name,
+                                                          reg->memory_size,
+                                                          reg->guest_phys_addr,
+                                                          reg->userspace_addr,
+                                                          offset);
+                    u->region_rb_offset[reg_idx] = offset;
+                    u->region_rb[reg_idx] = mr->ram_block;
+                }
+                msg->hdr.request = VHOST_USER_ADD_MEM_REG;
+                vhost_user_fill_msg_region(&region_buffer, reg, offset);
+                msg->payload.mem_reg.region = region_buffer;
+
+                ret = vhost_user_write(dev, msg, &fd, 1);
                 if (ret < 0) {
                     return ret;
                 }
 
-                reply_gpa = msg_reply.payload.mem_reg.region.guest_phys_addr;
+                if (track_ramblocks) {
+                    uint64_t reply_gpa;
 
-                if (msg_reply.hdr.request != VHOST_USER_ADD_MEM_REG) {
-                    error_report("%s: Received unexpected msg type."
-                                 "Expected %d received %d", __func__,
-                                 VHOST_USER_ADD_MEM_REG,
-                                 msg_reply.hdr.request);
-                    return -EPROTO;
-                }
+                    ret = vhost_user_read(dev, &msg_reply);
+                    if (ret < 0) {
+                        return ret;
+                    }
 
-                /*
-                 * We're using the same structure, just reusing one of the
-                 * fields, so it should be the same size.
-                 */
-                if (msg_reply.hdr.size != msg->hdr.size) {
-                    error_report("%s: Unexpected size for postcopy reply "
-                                 "%d vs %d", __func__, msg_reply.hdr.size,
-                                 msg->hdr.size);
-                    return -EPROTO;
-                }
+                    reply_gpa = msg_reply.payload.mem_reg.region.guest_phys_addr;
 
-                /* Get the postcopy client base from the backend's reply. */
-                if (reply_gpa == dev->mem->regions[reg_idx].guest_phys_addr) {
-                    shadow_pcb[reg_idx] =
-                        msg_reply.payload.mem_reg.region.userspace_addr;
-                    trace_vhost_user_set_mem_table_postcopy(
-                        msg_reply.payload.mem_reg.region.userspace_addr,
-                        msg->payload.mem_reg.region.userspace_addr,
-                        reg_fd_idx, reg_idx);
-                } else {
-                    error_report("%s: invalid postcopy reply for region. "
-                                 "Got guest physical address %" PRIX64 ", expected "
-                                 "%" PRIX64, __func__, reply_gpa,
-                                 dev->mem->regions[reg_idx].guest_phys_addr);
-                    return -EPROTO;
+                    if (msg_reply.hdr.request != VHOST_USER_ADD_MEM_REG) {
+                        error_report("%s: Received unexpected msg type."
+                                     "Expected %d received %d", __func__,
+                                     VHOST_USER_ADD_MEM_REG,
+                                     msg_reply.hdr.request);
+                        return -EPROTO;
+                    }
+
+                    /*
+                     * We're using the same structure, just reusing one of the
+                     * fields, so it should be the same size.
+                     */
+                    if (msg_reply.hdr.size != msg->hdr.size) {
+                        error_report("%s: Unexpected size for postcopy reply "
+                                     "%d vs %d", __func__, msg_reply.hdr.size,
+                                     msg->hdr.size);
+                        return -EPROTO;
+                    }
+
+                    /* Get the postcopy client base from the backend's reply. */
+                    if (reply_gpa == dev->mem->regions[reg_idx].guest_phys_addr) {
+                        shadow_pcb[reg_idx] =
+                            msg_reply.payload.mem_reg.region.userspace_addr;
+                        trace_vhost_user_set_mem_table_postcopy(
+                            msg_reply.payload.mem_reg.region.userspace_addr,
+                            msg->payload.mem_reg.region.userspace_addr,
+                            reg_fd_idx, reg_idx);
+                    } else {
+                        error_report("%s: invalid postcopy reply for region. "
+                                     "Got guest physical address %" PRIX64 ", expected "
+                                     "%" PRIX64, __func__, reply_gpa,
+                                     dev->mem->regions[reg_idx].guest_phys_addr);
+                        return -EPROTO;
+                    }
+                } else if (reply_supported) {
+                    ret = process_message_reply(dev, msg);
+                    if (ret) {
+                        return ret;
+                    }
                 }
-            } else if (reply_supported) {
-                ret = process_message_reply(dev, msg);
-                if (ret) {
-                    return ret;
-                }
+            } else if (track_ramblocks) {
+                u->region_rb_offset[reg_idx] = 0;
+                u->region_rb[reg_idx] = NULL;
             }
-        } else if (track_ramblocks) {
-            u->region_rb_offset[reg_idx] = 0;
-            u->region_rb[reg_idx] = NULL;
-        }
-
+	}
         /*
          * At this point, we know the backend has mapped in the new
          * region, if the region has a valid file descriptor.

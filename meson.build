@@ -3370,7 +3370,7 @@ endif
 
 vhost_user = not_found
 if targetos == 'linux' and have_vhost_user
-  libvhost_user = subproject('libvhost-user')
+  libvhost_user = subproject('libvhost-user', default_options: 'xen=disabled')
   vhost_user = libvhost_user.get_variable('vhost_user_dep')
 endif
 
