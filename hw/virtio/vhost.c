@@ -910,16 +910,15 @@ static int vhost_virtqueue_set_addr(struct vhost_dev *dev,
             return r;
         }
     } else {
-        if(!xen_enabled()) {
-            addr.desc_user_addr = (uint64_t)(unsigned long)vq->desc;
-            addr.avail_user_addr = (uint64_t)(unsigned long)vq->avail;
-            addr.used_user_addr = (uint64_t)(unsigned long)vq->used;
-        } else {
+        if (dev->vhost_ops->backend_type == VHOST_BACKEND_TYPE_USER && xen_enabled()) {
             addr.desc_user_addr = (uint64_t)(unsigned long)vq->desc_phys;
             addr.avail_user_addr = (uint64_t)(unsigned long)vq->avail_phys;
             addr.used_user_addr = (uint64_t)(unsigned long)vq->used_phys;
+        } else {
+            addr.desc_user_addr = (uint64_t)(unsigned long)vq->desc;
+            addr.avail_user_addr = (uint64_t)(unsigned long)vq->avail;
+            addr.used_user_addr = (uint64_t)(unsigned long)vq->used;
         }
-
     }
     addr.index = idx;
     addr.log_guest_addr = vq->used_phys;
