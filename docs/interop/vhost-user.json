@@ -46,6 +46,8 @@
 #
 # @scsi: virtio scsi
 #
+# @video: virtio video
+#
 # @vsock: virtio vsock transport
 #
 # @fs: virtio fs (since 4.2)
@@ -68,6 +70,7 @@
       'rpmsg',
       'rproc-serial',
       'scsi',
+      'video',
       'vsock',
       'fs'
   ]

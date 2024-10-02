@@ -46,6 +46,7 @@ libqos_srcs = files(
         'virtio-iommu.c',
         'virtio-gpio.c',
         'virtio-scmi.c',
+        'virtio-video.c',
         'generic-pcihost.c',
 
         # qgraph machines:
