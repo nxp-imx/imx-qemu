@@ -2317,6 +2317,14 @@ F: hw/virtio/vhost-user-scmi*
 F: include/hw/virtio/vhost-user-scmi.h
 F: tests/qtest/libqos/virtio-scmi.*
 
+virtio-video
+M: Albert Esteve <aesteve@redhat.com>
+S: Supported
+F: hw/display/vhost-user-video.c
+F: hw/display/vhost-user-video-pci.c
+F: include/hw/virtio/vhost-user-video.h
+F: tools/vhost-user-video/*
+
 virtio-crypto
 M: Gonglei <arei.gonglei@huawei.com>
 S: Supported
