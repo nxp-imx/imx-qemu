@@ -17,10 +17,12 @@
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <endian.h>
+#include <fcntl.h>
 #include "libvhost-user.h"
 
 #include <xenctrl.h>
 #include <xenforeignmemory.h>
+#include <xengnttab.h>
 
 void *vu_xen_foreignmap(uint32_t domainid, uint64_t addr, uint64_t size)
 {
@@ -115,4 +117,46 @@ bool vu_xen_add_mem_reg(VuDev *dev, VhostUserMsg *vmsg)
     dev->nregions++;
     /* false means no reply, true means reply. TODO: update to reply*/
     return false;
+}
+
+void* vu_open_grantdev(void)
+{
+    void* xen_gntdev_handle = NULL;
+
+    xen_gntdev_handle = xengnttab_open(NULL, 0);
+    if (!xen_gntdev_handle) {
+        DPRINT("can't open gnttab device\n");
+        return NULL;
+    }
+
+
+    return xen_gntdev_handle;
+}
+
+void vu_release_grantdev(void* handler)
+{
+    if (handler)
+        xengnttab_close(handler);
+
+}
+
+int vu_export_grant_resource_pages(void* handler, uint32_t domid, uint32_t count,uint32_t* refs)
+{
+   uint32_t dmabuf_fd;
+   int ret;
+
+   ret = xengnttab_dmabuf_exp_from_refs((xengnttab_handle *)handler, domid,
+                                      O_CLOEXEC | O_RDWR, count,
+                                      refs,
+                                      &dmabuf_fd);
+
+    DPRINT("export resource ret %d,fd %d",ret,dmabuf_fd);
+
+    return dmabuf_fd;
+}
+
+int vu_release_grant_resource_pages(void* handler, int fd)
+{
+    return xengnttab_dmabuf_exp_wait_released((xengnttab_handle *)handler,
+                                                fd, 1000);
 }
