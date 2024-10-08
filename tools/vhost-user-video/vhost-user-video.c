@@ -14,9 +14,9 @@
 #define G_LOG_DOMAIN "vhost-user-video"
 #define G_LOG_USE_STRUCTURED 1
 
-#include "qemu/osdep.h"
 #include <glib.h>
 #include <gio/gio.h>
+#include <glib-object.h>
 #include <gio/gunixsocketaddress.h>
 #include <glib-unix.h>
 #include <glib/gstdio.h>
@@ -31,9 +31,11 @@
 #include <unistd.h>
 #include <endian.h>
 #include <assert.h>
+#include <linux/dma-buf.h>
 
 #include "libvhost-user-glib.h"
 #include "libvhost-user.h"
+#include "libvhost-user-xen.h"
 #include "standard-headers/linux/virtio_video.h"
 
 #include "qemu/compiler.h"
@@ -214,25 +216,6 @@ handle_set_params_cmd(struct VuVideo *v, struct vu_video_ctrl_command *vio_cmd)
         goto out_unlock;
     }
 
-    if (V4L2_TYPE_IS_CAPTURE(buf_type)) {
-        /* decoder supports composing on CAPTURE */
-        struct v4l2_selection sel;
-        memset(&sel, 0, sizeof(struct v4l2_selection));
-
-        sel.r.left = le32toh(cmd->params.crop.left);
-        sel.r.top = le32toh(cmd->params.crop.top);
-        sel.r.width = le32toh(cmd->params.crop.width);
-        sel.r.height = le32toh(cmd->params.crop.height);
-
-        ret = v4l2_video_set_selection(s->fd, buf_type, &sel);
-        if (ret < 0) {
-            g_printerr("%s: v4l2_video_set_selection failed: %s (%d).\n"
-                       , __func__, g_strerror(errno), errno);
-            cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_PARAMETER;
-            goto out_unlock;
-        }
-    }
-
     cmd->hdr.type = VIRTIO_VIDEO_RESP_OK_NODATA;
 
 out_unlock:
@@ -292,13 +275,25 @@ handle_get_params_cmd(struct VuVideo *v, struct vu_video_ctrl_command *vio_cmd)
     /* convert from v4l2 to virtio */
     v4l2_to_virtio_video_params(v->v4l2_dev, &fmt, &sel,
                                 &getparams_reply);
+    
+    if (V4L2_TYPE_IS_CAPTURE(buf_type) && (v->v4l2_dev->dev_type & STATEFUL_DECODER))
+        getparams_reply.params.min_buffers = htole32(s->min_buffers_for_capture);
 
     getparams_reply.hdr.type = VIRTIO_VIDEO_RESP_OK_GET_PARAMS;
 
+
 out_unlock:
     vio_cmd->finished = true;
-    send_ctrl_response(vio_cmd, (uint8_t *)&getparams_reply,
+    g_debug("send get params resposne,state %d,capture cnt %d\n",s->stream_state,s->capture_bufcount);
+    send_ctrl_response_sync(vio_cmd, (uint8_t *)&getparams_reply,
                        sizeof(struct virtio_video_get_params_resp));
+    if (V4L2_TYPE_IS_CAPTURE(buf_type)) {
+        if(s->stream_state == STREAM_SRC_CHGING) {
+            s->stream_state = STREAM_DRAINING;
+            g_debug("set stream state draining");
+            g_cond_signal(&s->stream_cond);
+        }
+    }
     g_mutex_unlock(&s->mutex);
 }
 
@@ -355,10 +350,9 @@ void free_resource_mem(struct resource *r)
     }
 }
 
-void remove_all_resources(struct stream *s, uint32_t queue_type)
+static void close_all_dmabuf(struct stream *s, uint32_t queue_type)
 {
     GList **resource_list;
-    struct resource *r;
 
     /* assumes stream mutex is held by caller */
 
@@ -374,22 +368,70 @@ void remove_all_resources(struct stream *s, uint32_t queue_type)
         return;
     }
 
-    g_debug("%s: resource_list has %d elements", __func__
-            , g_list_length(*resource_list));
+    GList *l = *resource_list;
+    while (l != NULL) {
+        GList *next = l->next;
+        l = next;
+   }
+}
+
+void remove_all_resources(struct stream *s, uint32_t queue_type)
+{
+    GList **resource_list;
+    struct resource *r;
+    int ret;
+
+    /* assumes stream mutex is held by caller */
+
+    switch (queue_type) {
+    case VIRTIO_VIDEO_QUEUE_TYPE_INPUT:
+        g_debug("output buffers:\n\n");
+        resource_list = &s->inputq_resources;
+        break;
+    case VIRTIO_VIDEO_QUEUE_TYPE_OUTPUT:
+        g_debug("capture buffers:\n\n");
+        resource_list = &s->outputq_resources;
+        break;
+    default:
+        g_debug("%s: Invalid virtio queue!", __func__);
+        return;
+    }
 
     GList *l = *resource_list;
     while (l != NULL) {
         GList *next = l->next;
         r = (struct resource *)l->data;
         if (r) {
-            g_debug("%s: Removing resource_id(%d) resource=%p"
-                    , __func__, r->vio_resource.resource_id, r);
-
             /*
              * Assumes that either QUEUE_CLEAR or normal dequeuing
              * of buffers will have freed resource_queue cmd memory
              */
+            g_debug("statistics: from dqbuf->qbuf: \n");
+            stats_print_events("BUF DQ->Q", &r->dqqbuf,100);
+            g_debug("[%-22s] %10u (us)\n", "DQ-Q BUF min",
+		    stats_min_delta_events(&r->dqqbuf));
+	        g_debug("[%-22s] %10u (us)\n", "DQ-Q BUF avg",
+		    stats_avg_delta_events(&r->dqqbuf));
+	        g_debug("[%-22s] %10u (us)\n", "DQ-Q BUF max",
+		    stats_max_delta_events(&r->dqqbuf));
 
+            g_debug("statistics: from qbuf->Dqbuf: \n");
+            stats_print_events("BUF Q->DQ", &r->qdqbuf,100);
+            g_debug("[%-22s] %10u (us)\n", "Q-DQ BUF min",
+		    stats_min_delta_events(&r->qdqbuf));
+	        g_debug("[%-22s] %10u (us)\n", "Q-DQ BUF avg",
+		    stats_avg_delta_events(&r->qdqbuf));
+	        g_debug("[%-22s] %10u (us)\n", "Q-DQ BUF max",
+		    stats_max_delta_events(&r->qdqbuf));
+
+            g_debug("dmabuf close fd %d",r->dma_fd);
+
+            close(r->dma_fd);
+
+            ret = vu_release_grant_resource_pages(s->gntdev_handler, r->dma_fd);
+            if(ret)
+                g_debug("release grant dmabuf %d fail,ret %d",r->dma_fd,ret);
+  
             /* free resource memory allocated in resource_create() */
             g_free(r->iov);
             if (r->buf != NULL) {
@@ -417,7 +459,7 @@ struct resource *find_resource(struct stream *s, uint32_t resource_id,
         l = s->outputq_resources;
         break;
     default:
-        g_error("%s: Invalid queue type!", __func__);
+        g_debug("%s: Invalid queue type!", __func__);
         return NULL;
     }
 
@@ -450,18 +492,13 @@ struct resource *find_resource_by_v4l2index(struct stream *s,
         break;
 
     default:
-        g_error("Unsupported buffer type\n");
+        g_debug("Unsupported buffer type");
         return NULL;
     }
 
     for (; l != NULL; l = l->next) {
         r = (struct resource *)l->data;
         if (r->v4l2_index == v4l2_index) {
-            g_debug("%s: found Resource=%p streamid(%d) resourceid(%d) "
-                    "numplanes(%d) planes_layout(0x%x) vio_q_cmd=%p", __func__,
-                    r, r->stream_id, r->vio_resource.resource_id,
-                    r->vio_resource.num_planes, r->vio_resource.planes_layout,
-                    r->vio_q_cmd);
             return r;
         }
     }
@@ -496,7 +533,6 @@ static void *stream_worker_thread(gpointer data)
 
         g_mutex_lock(&s->mutex);
 
-        g_debug("Stream: id %d state %d", s->stream_id, s->stream_state);
         /* wait for STREAMING or DESTROYING state */
         while (s->stream_state != STREAM_DESTROYING &&
                s->stream_state != STREAM_STREAMING &&
@@ -504,7 +540,7 @@ static void *stream_worker_thread(gpointer data)
             g_cond_wait(&s->stream_cond, &s->mutex);
 
         if (s->stream_state == STREAM_DESTROYING) {
-            g_debug("stream worker thread exiting!");
+            g_debug("$$$$$$$$$$stream worker thread exiting!");
             s->stream_state = STREAM_DESTROYED;
             g_cond_signal(&s->stream_cond);
             g_mutex_unlock(&s->mutex);
@@ -523,13 +559,13 @@ static void *stream_worker_thread(gpointer data)
         struct timeval tv = { 0 , 500000 };
         res = select(s->fd + 1, &rfds, &wfds, &efds, &tv);
         if (res < 0) {
-            g_printerr("%s:%d - select() failed: %s (%d)\n",
+            g_debug("%s:%d - select() failed: %s (%d)!!!!!!!!!!!!",
                        __func__, __LINE__, g_strerror(errno), errno);
             break;
         }
 
         if (res == 0) {
-            g_debug("%s:%d - select() timeout", __func__, __LINE__);
+            g_debug("%s:%d - select() timeout!!!!!!!!!!!!!!!", __func__, __LINE__);
             continue;
         }
 
@@ -538,26 +574,33 @@ static void *stream_worker_thread(gpointer data)
         have_write = FD_ISSET(s->fd, &wfds);
         /* read is capture queue, write is output queue */
 
-        g_debug("%s:%d have_event=%d, have_write=%d, have_read=%d\n",
-                __func__, __LINE__, FD_ISSET(s->fd, &efds),
-                FD_ISSET(s->fd, &wfds), FD_ISSET(s->fd, &rfds));
+       // g_debug("$$$%s:%d have_event=%d, have_write=%d, have_read=%d",
+              //  __func__, __LINE__, FD_ISSET(s->fd, &efds),
+               // FD_ISSET(s->fd, &wfds), FD_ISSET(s->fd, &rfds));
 
         g_mutex_lock(&s->mutex);
 
         if (have_event) {
-            g_debug("%s: have_event!", __func__);
             res = ioctl(s->fd, VIDIOC_DQEVENT, &ev);
             if (res < 0) {
-                g_printerr("%s:%d - VIDIOC_DQEVENT failed: %s (%d)\n",
+                g_debug("%s:%d - VIDIOC_DQEVENT failed: %s (%d)",
                            __func__, __LINE__, g_strerror(errno), errno);
+                g_mutex_unlock(&s->mutex);
                 break;
             }
             v4l2_to_virtio_event(&ev, &vio_event);
-
+            if (ev.type == V4L2_EVENT_SOURCE_CHANGE) {
+                v4l2_ioctl_get_control(s->fd, V4L2_CID_MIN_BUFFERS_FOR_CAPTURE, &s->min_buffers_for_capture);
+                if(s->init_seq_flag) {
+                    s->stream_state = STREAM_SRC_CHGING;
+                    g_debug("get src change,stream state enter into SRC CHANGING,state %d\n",s->stream_state);
+                }
+            }
             /* get event workqueue */
             elem = vu_queue_pop(vudev, vq, sizeof(struct VuVirtqElement));
             if (!elem) {
-                g_debug("%s:%d\n", __func__, __LINE__);
+                g_debug("%s:%d", __func__, __LINE__);
+                g_mutex_unlock(&s->mutex);
                 break;
             }
 
@@ -571,7 +614,7 @@ static void *stream_worker_thread(gpointer data)
             }
         }
 
-        if (have_read && s->capture_streaming) {
+        if (have_read && s->capture_streaming && s->stream_state != STREAM_SRC_CHGING) {
             /* TODO assumes decoder */
             buf_type = s->has_mplane ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
                 : V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -582,13 +625,13 @@ static void *stream_worker_thread(gpointer data)
 
             ret = v4l2_dequeue_buffer(s->fd, buf_type, memory, s);
             if (ret < 0) {
-                g_info("%s: v4l2_dequeue_buffer() failed CAPTURE ret(%d)",
+                g_debug("%s: v4l2_dequeue_buffer() failed CAPTURE ret(%d)",
                        __func__, ret);
 
                 if (ret == -EPIPE) {
                     g_debug("Dequeued last buffer, stop streaming.");
                     /* dequeued last buf, so stop streaming */
-                    v4l2_streamoff(s, buf_type);
+                    //v4l2_streamoff(s, buf_type);
                 }
             }
         }
@@ -603,8 +646,7 @@ static void *stream_worker_thread(gpointer data)
 
             ret = v4l2_dequeue_buffer(s->fd, buf_type, memory, s);
             if (ret < 0) {
-                g_info("%s: v4l2_dequeue_buffer() failed OUTPUT ret(%d)",
-                       __func__, ret);
+                g_debug("%s: v4l2_dequeue_buffer() failed OUTPUT ret(%d)", __func__, ret);
             }
         }
 
@@ -625,16 +667,13 @@ void handle_queue_clear_cmd(struct VuVideo *v,
     enum virtio_video_queue_type queue_type = le32toh(cmd->queue_type);
     GList *res_list = NULL;
 
-    g_debug("%s: stream_id(%d) %s\n", __func__, stream_id,
-            vio_queue_name(queue_type));
-
     if (!v || !cmd) {
         return;
     }
 
     s = find_stream(v, stream_id);
     if (!s) {
-        g_critical("%s: stream_id(%d) not found", __func__, stream_id);
+        g_debug("%s: stream_id(%d) not found", __func__, stream_id);
         cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_PARAMETER;
         return;
     }
@@ -665,6 +704,7 @@ void handle_queue_clear_cmd(struct VuVideo *v,
     }
 
     /* iterate the queues resources list - and send a reply to each one */
+    close_all_dmabuf(s, queue_type);
 
     /*
      * If the processing was stopped due to VIRTIO_VIDEO_CMD_QUEUE_CLEAR,
@@ -693,7 +733,7 @@ GList *get_resource_list(struct stream *s, uint32_t queue_type)
         return s->outputq_resources;
         break;
     default:
-        g_critical("%s: Unknown queue type!", __func__);
+        g_debug("%s: Unknown queue type!", __func__);
         return NULL;
     }
 }
@@ -710,12 +750,37 @@ void send_ctrl_response(struct vu_video_ctrl_command *vio_cmd,
                             vio_cmd->elem.in_num, 0, resp, resp_len);
 
     if (len != resp_len) {
-        g_critical("%s: response size incorrect %zu vs %zu",
+        g_debug("%s: response size incorrect %zu vs %zu",
                    __func__, len, resp_len);
     }
 
     vu_queue_push(vio_cmd->dev, vio_cmd->vq, &vio_cmd->elem, len);
     vu_queue_notify(vio_cmd->dev, vio_cmd->vq);
+
+    if (vio_cmd->finished) {
+        g_free(vio_cmd->cmd_buf);
+        free(vio_cmd);
+    }
+}
+
+void send_ctrl_response_sync(struct vu_video_ctrl_command *vio_cmd,
+                       uint8_t *resp, size_t resp_len)
+{
+    size_t len;
+
+    virtio_video_ctrl_hdr_htole((struct virtio_video_cmd_hdr *)resp);
+
+    /* send virtio_video_resource_queue_resp */
+    len = iov_from_buf_full(vio_cmd->elem.in_sg,
+                            vio_cmd->elem.in_num, 0, resp, resp_len);
+
+    if (len != resp_len) {
+        g_debug("%s: response size incorrect %zu vs %zu",
+                   __func__, len, resp_len);
+    }
+
+    vu_queue_push(vio_cmd->dev, vio_cmd->vq, &vio_cmd->elem, len);
+    vu_queue_notify_sync(vio_cmd->dev, vio_cmd->vq);
 
     if (vio_cmd->finished) {
         g_free(vio_cmd->cmd_buf);
@@ -765,7 +830,7 @@ static int
 handle_resource_create_cmd(struct VuVideo *v,
                            struct vu_video_ctrl_command *vio_cmd)
 {
-    int ret = 0, i;
+    int ret = 0, i, k;
     uint32_t total_entries = 0;
     uint32_t stream_id;
     struct virtio_video_resource_create *cmd =
@@ -779,7 +844,7 @@ handle_resource_create_cmd(struct VuVideo *v,
 
     s = find_stream(v, stream_id);
     if (!s) {
-        g_critical("%s: stream_id(%d) not found", __func__, stream_id);
+        g_debug("%s: stream_id(%d) not found", __func__, stream_id);
         cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_PARAMETER;
         return ret;
     }
@@ -787,7 +852,7 @@ handle_resource_create_cmd(struct VuVideo *v,
     g_mutex_lock(&s->mutex);
 
     if (le32toh(cmd->resource_id) == 0) {
-        g_critical("%s: resource id 0 is not allowed", __func__);
+        g_debug("%s: resource id 0 is not allowed", __func__);
         cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_PARAMETER;
         goto out_unlock;
     }
@@ -795,7 +860,7 @@ handle_resource_create_cmd(struct VuVideo *v,
     /* check resource id doesn't already exist */
     res = find_resource(s, le32toh(cmd->resource_id), le32toh(cmd->queue_type));
     if (res) {
-        g_critical("%s: resource_id:%d already exists"
+        g_debug("%s: resource_id:%d already exists"
                    , __func__, le32toh(cmd->resource_id));
         cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_RESOURCE_ID;
         goto out_unlock;
@@ -816,16 +881,19 @@ handle_resource_create_cmd(struct VuVideo *v,
             res->v4l2_index = g_list_length(s->outputq_resources);
             break;
         default:
-            g_critical("%s: invalid queue_type(%s) resource_id(%d)",
+            g_debug("%s: invalid queue_type(%s) resource_id(%d)",
                        __func__, vio_queue_name(r->queue_type),
                        le32toh(cmd->resource_id));
             cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_RESOURCE_ID;
             goto out_unlock;
         }
 
+        stats_init_events(&res->dqqbuf);
+        stats_init_events(&res->qdqbuf);
+
         ret = add_resource(s, res, le32toh(cmd->queue_type));
         if (ret) {
-            g_critical("%s: resource_add id:%d failed",
+            g_debug("%s: resource_add id:%d failed",
                        __func__, le32toh(cmd->resource_id));
             cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_RESOURCE_ID;
             goto out_unlock;
@@ -870,9 +938,9 @@ handle_resource_create_cmd(struct VuVideo *v,
         res->iov = g_malloc0(sizeof(struct iovec) * total_entries);
         for (i = 0; i < total_entries; i++) {
             uint64_t len = le32toh(ent[i].length);
-            g_debug("%s: ent[%d] addr=0x%lx",
-                    __func__, i, le64toh(ent[i].addr));
-
+            g_debug("\n%s: ent[%d] addr=0x%lx len %ld",
+                    __func__, i, le64toh(ent[i].addr),len);
+            res->gpa[i] = le64toh(ent[i].addr);
             res->iov[i].iov_len = le32toh(ent[i].length);
             res->iov[i].iov_base =
                 vu_gpa_to_va(&v->dev.parent, &len, le64toh(ent[i].addr));
@@ -880,6 +948,14 @@ handle_resource_create_cmd(struct VuVideo *v,
                     , i, res->iov[i].iov_len);
             g_debug("%s: [%d] iov_base = 0x%p", __func__
                     , i, res->iov[i].iov_base);
+            res->ref_count = le32toh(ent[i].grant_ref_count);
+
+            for(k=0; k < res->ref_count; k++) {
+                res->ref[k] = le32toh(ent[i].grant_ref_header) + k;
+            }
+
+            res->dma_fd = vu_export_grant_resource_pages(s->gntdev_handler,v->dev.parent.xen_domainid,res->ref_count,&res->ref[0]);
+            g_debug("dma fd %d",res->dma_fd);
         }
         res->iov_count = total_entries;
     } break;
@@ -917,17 +993,11 @@ handle_resource_queue_cmd(struct VuVideo *v,
     uint32_t stream_id;
     int ret = 0;
 
-    g_debug("%s: type(0x%x) %s resource_id(%d)", __func__,
-            cmd->hdr.type, vio_queue_name(le32toh(cmd->queue_type)),
-            le32toh(cmd->resource_id));
-    g_debug("%s: num_data_sizes = %d", __func__, le32toh(cmd->num_data_sizes));
-    g_debug("%s: data_sizes[0] = %d", __func__, le32toh(cmd->data_sizes[0]));
-
     stream_id = cmd->hdr.stream_id;
 
     s = find_stream(v, stream_id);
     if (!s) {
-        g_critical("%s: stream_id(%d) not found", __func__, stream_id);
+        g_debug("%s: stream_id(%d) not found", __func__, stream_id);
         cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_PARAMETER;
         return ret;
     }
@@ -935,7 +1005,7 @@ handle_resource_queue_cmd(struct VuVideo *v,
     g_mutex_lock(&s->mutex);
 
     if (cmd->resource_id == 0) {
-        g_critical("%s: resource id 0 is not allowed", __func__);
+        g_debug("%s: resource id 0 is not allowed", __func__);
         cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_RESOURCE_ID;
         goto out_unlock;
     }
@@ -945,7 +1015,7 @@ handle_resource_queue_cmd(struct VuVideo *v,
             ret = video_resource_create(s, le32toh(cmd->queue_type),
                                         g_list_length(s->inputq_resources));
             if (ret < 0) {
-                g_critical("%s: output buffer allocation failed", __func__);
+                g_debug("%s: output buffer allocation failed", __func__);
                 cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_PARAMETER;
                 goto out_unlock;
             }
@@ -955,7 +1025,7 @@ handle_resource_queue_cmd(struct VuVideo *v,
             ret = video_resource_create(s, le32toh(cmd->queue_type),
                                         g_list_length(s->outputq_resources));
             if (ret < 0) {
-                g_critical("%s: capture buffer allocation failed", __func__);
+                g_debug("%s: capture buffer allocation failed", __func__);
                 cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_PARAMETER;
                 goto out_unlock;
             }
@@ -965,7 +1035,7 @@ handle_resource_queue_cmd(struct VuVideo *v,
     /* get resource object */
     res = find_resource(s, le32toh(cmd->resource_id), le32toh(cmd->queue_type));
     if (!res) {
-        g_critical("%s: resource_id:%d does not exist!"
+        g_debug("%s: resource_id:%d does not exist!"
                    , __func__, le32toh(cmd->resource_id));
         cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_RESOURCE_ID;
         goto out_unlock;
@@ -976,8 +1046,6 @@ handle_resource_queue_cmd(struct VuVideo *v,
     res->vio_res_q.queue_type = le32toh(cmd->queue_type);
     res->vio_q_cmd = vio_cmd;
 
-    g_debug("%s: res=%p res->vio_q_cmd=0x%p", __func__, res, res->vio_q_cmd);
-
     enum v4l2_buf_type buf_type = get_v4l2_buf_type(
         cmd->queue_type, s->has_mplane);
     enum virtio_video_mem_type mem_type =
@@ -986,7 +1054,7 @@ handle_resource_queue_cmd(struct VuVideo *v,
 
     ret = v4l2_queue_buffer(buf_type, memory, cmd, res, s, v->v4l2_dev, v->bm_dev);
     if (ret < 0) {
-        g_critical("%s: v4l2_queue_buffer failed", __func__);
+        g_debug("%s: v4l2_queue_buffer failed\n", __func__);
         /* virtio error set by v4l2_queue_buffer */
         goto out_unlock;
     }
@@ -1018,13 +1086,13 @@ handle_resource_destroy_all_cmd(struct VuVideo *v,
     struct stream *s;
     int ret = 0;
 
-    g_debug("%s: type(0x%x) %s stream_id(%d)", __func__,
+    g_debug("%s: type(0x%x) %s stream_id(%d)\n", __func__,
             cmd->hdr.type, vio_queue_name(le32toh(cmd->queue_type)),
             cmd->hdr.stream_id);
 
     s = find_stream(v, cmd->hdr.stream_id);
     if (!s) {
-        g_critical("%s: stream_id(%d) not found", __func__, cmd->hdr.stream_id);
+        g_debug("%s: stream_id(%d) not found", __func__, cmd->hdr.stream_id);
         cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_PARAMETER;
         goto out;
     }
@@ -1037,9 +1105,15 @@ handle_resource_destroy_all_cmd(struct VuVideo *v,
 
     ret = video_free_buffers(s->fd, buf_type, get_v4l2_memory(mem_type));
     if (ret) {
-        g_critical("%s: video_free_buffers() failed", __func__);
+        g_debug("%s: video_free_buffers() failed\n", __func__);
         cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_PARAMETER;
         goto out;
+    }
+
+    if (V4L2_TYPE_IS_OUTPUT(buf_type)) {
+        s->output_bufcount = 0;
+    } else if (V4L2_TYPE_IS_CAPTURE(buf_type)) {
+        s->capture_bufcount = 0;
     }
 
     remove_all_resources(s, le32toh(cmd->queue_type));
@@ -1066,7 +1140,7 @@ handle_stream_create_cmd(struct VuVideo *v,
         (struct virtio_video_stream_create *)vio_cmd->cmd_buf;
 
     g_debug("%s: type(0x%x) stream_id(%d) in_mem_type(0x%x) "
-            "out_mem_type(0x%x) coded_format(0x%x)",
+            "out_mem_type(0x%x) coded_format(0x%x)\n",
             __func__, cmd->hdr.type, cmd->hdr.stream_id,
             le32toh(cmd->in_mem_type), le32toh(cmd->out_mem_type),
             le32toh(cmd->coded_format));
@@ -1075,7 +1149,7 @@ handle_stream_create_cmd(struct VuVideo *v,
     coded_format = le32toh(cmd->coded_format);
 
     if (find_stream(v, req_stream_id)) {
-        g_debug("%s: Stream ID in use - ", __func__);
+        g_debug("%s: Stream ID in use - \n", __func__);
         cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_STREAM_ID;
     } else {
         s = g_new0(struct stream, 1);
@@ -1093,13 +1167,14 @@ handle_stream_create_cmd(struct VuVideo *v,
         g_mutex_init(&s->mutex);
         g_cond_init(&s->stream_cond);
         v->streams = g_list_append(v->streams, s);
+        s->min_buffers_for_capture = 1;
 
         cmd->hdr.type = VIRTIO_VIDEO_RESP_OK_NODATA;
 
         /* set the requested coded format */
         ret = v4l2_stream_create(v->v4l2_dev, coded_format, s);
         if (ret < 0) {
-            g_printerr("%s: v4l2_stream_create() failed", __func__);
+            g_debug("%s: v4l2_stream_create() failed\n", __func__);
             cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_PARAMETER;
 
             v->streams = g_list_remove(v->streams, s);
@@ -1114,6 +1189,8 @@ handle_stream_create_cmd(struct VuVideo *v,
          */
         s->worker_thread = g_thread_new("vio-video stream worker",
                                         stream_worker_thread, s);
+                                    
+        s->gntdev_handler = vu_open_grantdev();
     }
 
     /* send response */
@@ -1133,7 +1210,7 @@ handle_stream_drain_cmd(struct VuVideo *v,
 
     stream_id = cmd->hdr.stream_id;
 
-    g_debug("%s: stream_id(%d)", __func__, stream_id);
+    g_debug("****%s: stream_id(%d)\n", __func__, stream_id);
 
     s = find_stream(v, stream_id);
     if (!s) {
@@ -1141,15 +1218,17 @@ handle_stream_drain_cmd(struct VuVideo *v,
         return;
     }
 
-    g_debug("%s: Found stream=0x%p", __func__, s);
-
     g_mutex_lock(&s->mutex);
-
-    ret = v4l2_issue_cmd(s->fd, V4L2_DEC_CMD_STOP, 0);
+    if (v->v4l2_dev->dev_type & STATEFUL_ENCODER) {
+        ret = v4l2_encoder_issue_cmd(s->fd, V4L2_ENC_CMD_STOP, 0);
+    } else {
+        ret = v4l2_decoder_issue_cmd(s->fd, V4L2_DEC_CMD_STOP, 0);
+    }
     if (ret < 0) {
         cmd->hdr.type = VIRTIO_VIDEO_RESP_ERR_INVALID_PARAMETER;
         goto out_unlock;
     }
+    g_debug("receive drain cmd\n");
     s->stream_state = STREAM_DRAINING;
     g_cond_signal(&s->stream_cond);
 
@@ -1177,7 +1256,7 @@ handle_stream_destroy_cmd(struct VuVideo *v,
 
     stream_id = cmd->hdr.stream_id;
 
-    g_debug("%s: stream_id=(%d)", __func__, stream_id);
+    g_debug("%s: stream_id=(%d)\n", __func__, stream_id);
 
     s = find_stream(v, stream_id);
 
@@ -1187,9 +1266,10 @@ handle_stream_destroy_cmd(struct VuVideo *v,
     }
 
     if (s) {
-        g_debug("%s: Found stream=0x%p", __func__, s);
+        g_debug("%s: Found stream=0x%p\n", __func__, s);
 
         g_mutex_lock(&s->mutex);
+
         /* TODO assumes decoder */
         buftype = s->has_mplane ? V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
             : V4L2_BUF_TYPE_VIDEO_OUTPUT;
@@ -1225,6 +1305,9 @@ handle_stream_destroy_cmd(struct VuVideo *v,
 
         v4l2_close(s->fd);
 
+        vu_release_grantdev(s->gntdev_handler);
+        s->gntdev_handler = NULL;
+
         v->streams = g_list_remove(v->streams, (gconstpointer) s);
         cmd->hdr.type = VIRTIO_VIDEO_RESP_OK_NODATA;
     }
@@ -1254,6 +1337,26 @@ struct virtio_video_get_control_resp_bitrate {
     struct virtio_video_control_val_bitrate bitrate;
 };
 
+struct virtio_video_get_control_resp_bitrate_mode {
+    struct virtio_video_cmd_hdr hdr;
+    struct virtio_video_control_val_bitrate_mode bitrate_mode;
+};
+
+struct virtio_video_get_control_resp_peak {
+    struct virtio_video_cmd_hdr hdr;
+    struct virtio_video_control_val_bitrate_peak peak;
+};
+
+struct virtio_video_get_control_resp_header_mode {
+    struct virtio_video_cmd_hdr hdr;
+    struct virtio_video_control_val_prepend_spspps_to_idr header;
+};
+
+struct virtio_video_get_control_resp_gop_size {
+    struct virtio_video_cmd_hdr hdr;
+    struct virtio_video_control_val_gop_size gop;
+};
+
 static int
 handle_query_control_cmd(struct VuVideo *v,
                          struct vu_video_ctrl_command *cmd)
@@ -1266,9 +1369,6 @@ handle_query_control_cmd(struct VuVideo *v,
 
     struct virtio_video_query_control *qcmd =
         (struct virtio_video_query_control *)cmd->cmd_buf;
-
-    g_debug("%s: type(0x%x) stream_id(%d) control(0x%x)", __func__,
-            qcmd->hdr.type, qcmd->hdr.stream_id, le32toh(qcmd->control));
 
     v4l2_control = virtio_video_control_to_v4l2(le32toh(qcmd->control));
     if (!v4l2_control) {
@@ -1285,11 +1385,9 @@ handle_query_control_cmd(struct VuVideo *v,
         ctl_resp_profile = (void *)&ctl_resp +
             sizeof(struct virtio_video_query_control_resp_profile);
 
-        g_debug("%s: VIRTIO_VIDEO_CONTROL_PROFILE", __func__);
-
         ret = v4l2_ioctl_query_control(v->v4l2_dev->fd, v4l2_control, &value);
         if (ret < 0) {
-            g_printerr("v4l2_ioctl_query_control() failed\n");
+            g_debug("v4l2_ioctl_query_control() failed\n");
             goto out_err_unlock;
         }
 
@@ -1306,11 +1404,9 @@ handle_query_control_cmd(struct VuVideo *v,
         ctl_resp_level = (void *)&ctl_resp +
             sizeof(struct virtio_video_query_control_resp_level);
 
-        g_debug("%s: VIRTIO_VIDEO_CONTROL_LEVEL", __func__);
-
         ret = v4l2_ioctl_query_control(v->v4l2_dev->fd, v4l2_control, &value);
         if (ret < 0) {
-            g_printerr("v4l2_ioctl_query_control() failed\n");
+            g_debug("v4l2_ioctl_query_control() failed\n");
             goto out_err_unlock;
         }
 
@@ -1322,7 +1418,7 @@ handle_query_control_cmd(struct VuVideo *v,
         break;
 
     default:
-        g_critical("Unknown control requested!");
+        g_debug("Unknown control requested!\n");
         goto out_err_unlock;
         break;
     }
@@ -1349,18 +1445,19 @@ handle_get_control_cmd(struct VuVideo *v, struct vu_video_ctrl_command *vio_cmd)
     struct virtio_video_get_control_resp_level   ctl_resp_level;
     struct virtio_video_get_control_resp_profile ctl_resp_profile;
     struct virtio_video_get_control_resp_bitrate ctl_resp_bitrate;
+    struct virtio_video_get_control_resp_bitrate_mode ctrl_resp_bitrate_mode;
+    struct virtio_video_get_control_resp_peak ctl_resp_peak;
+    struct virtio_video_get_control_resp_header_mode ctrl_resp_header_mode;
+    struct virtio_video_get_control_resp_gop_size ctrl_resp_gop_size;
 
     struct stream *s;
 
     struct virtio_video_get_control *cmd =
         (struct virtio_video_get_control *)vio_cmd->cmd_buf;
 
-    g_debug("%s: type(0x%x) stream_id(%d) control(0x%x)", __func__,
-            cmd->hdr.type, cmd->hdr.stream_id, le32toh(cmd->control));
-
     s = find_stream(v, cmd->hdr.stream_id);
     if (!s) {
-        g_critical("%s: stream_id(%d) not found", __func__, cmd->hdr.stream_id);
+        g_debug("%s: stream_id(%d) not found\n", __func__, cmd->hdr.stream_id);
         return -EINVAL;
     }
 
@@ -1374,21 +1471,18 @@ handle_get_control_cmd(struct VuVideo *v, struct vu_video_ctrl_command *vio_cmd)
 
     switch (le32toh(cmd->control)) {
     case VIRTIO_VIDEO_CONTROL_BITRATE:
-        g_debug("%s: VIRTIO_VIDEO_CONTROL_BITRATE", __func__);
-
         ctl_resp_bitrate.hdr.stream_id = cmd->hdr.stream_id;
         ctl_resp_bitrate.hdr.type = VIRTIO_VIDEO_RESP_OK_GET_PARAMS;
 
         if (v->v4l2_dev->dev_type == STATEFUL_ENCODER) {
             ret = v4l2_ioctl_get_control(s->fd, v4l2_control, &value);
             if (ret < 0) {
-                g_printerr("v4l2_ioctl_get_control() failed\n");
                 goto out_err_unlock;
             }
             ctl_resp_bitrate.bitrate.bitrate = htole32(value);
 
         } else {
-            g_debug("%s: CONTROL_BITRATE unsupported for decoders!", __func__);
+            g_debug("%s: CONTROL_BITRATE unsupported for decoders!\n", __func__);
             goto out_err_unlock;
         }
 
@@ -1399,14 +1493,11 @@ handle_get_control_cmd(struct VuVideo *v, struct vu_video_ctrl_command *vio_cmd)
         break;
 
     case VIRTIO_VIDEO_CONTROL_PROFILE:
-        g_debug("%s: VIRTIO_VIDEO_CONTROL_PROFILE", __func__);
-
         ctl_resp_profile.hdr.stream_id = cmd->hdr.stream_id;
         ctl_resp_profile.hdr.type = VIRTIO_VIDEO_RESP_OK_GET_PARAMS;
 
         ret = v4l2_ioctl_get_control(s->fd, v4l2_control, &value);
         if (ret < 0) {
-            g_printerr("v4l2_ioctl_get_control() failed\n");
             goto out_err_unlock;
         }
 
@@ -1425,14 +1516,11 @@ handle_get_control_cmd(struct VuVideo *v, struct vu_video_ctrl_command *vio_cmd)
         break;
 
     case VIRTIO_VIDEO_CONTROL_LEVEL:
-        g_debug("%s: VIRTIO_VIDEO_CONTROL_LEVEL", __func__);
-
         ctl_resp_level.hdr.stream_id = cmd->hdr.stream_id;
         ctl_resp_level.hdr.type = VIRTIO_VIDEO_RESP_OK_GET_PARAMS;
 
         ret = v4l2_ioctl_get_control(s->fd, v4l2_control, &value);
         if (ret < 0) {
-            g_printerr("v4l2_ioctl_get_control() failed\n");
             goto out_err_unlock;
         }
 
@@ -1444,14 +1532,67 @@ handle_get_control_cmd(struct VuVideo *v, struct vu_video_ctrl_command *vio_cmd)
         break;
 
     case VIRTIO_VIDEO_CONTROL_BITRATE_MODE:
-    case VIRTIO_VIDEO_CONTROL_BITRATE_PEAK:
-    case VIRTIO_VIDEO_CONTROL_PREPEND_SPSPPS_TO_IDR:
-        g_info("Unsupported control requested");
-        goto out_err_unlock;
-        break;
+        ctrl_resp_bitrate_mode.hdr.stream_id = cmd->hdr.stream_id;
+        ctrl_resp_bitrate_mode.hdr.type = VIRTIO_VIDEO_RESP_OK_GET_PARAMS;
 
+        ret = v4l2_ioctl_get_control(s->fd, v4l2_control, &value);
+        if (ret < 0) {
+            goto out_err_unlock;
+        }
+
+        ctrl_resp_bitrate_mode.bitrate_mode.bitrate_mode = htole32(value);
+
+        vio_cmd->finished = true;
+        send_ctrl_response(vio_cmd, (uint8_t *)&ctrl_resp_bitrate_mode,
+                           sizeof(struct virtio_video_get_control_resp_bitrate_mode));
+        break;
+    case VIRTIO_VIDEO_CONTROL_BITRATE_PEAK:
+        ctl_resp_peak.hdr.stream_id = cmd->hdr.stream_id;
+        ctl_resp_peak.hdr.type = VIRTIO_VIDEO_RESP_OK_GET_PARAMS;
+
+        ret = v4l2_ioctl_get_control(s->fd, v4l2_control, &value);
+        if (ret < 0) {
+            goto out_err_unlock;
+        }
+
+        ctl_resp_peak.peak.bitrate_peak = htole32(value);
+
+        vio_cmd->finished = true;
+        send_ctrl_response(vio_cmd, (uint8_t *)&ctl_resp_peak,
+                           sizeof(struct virtio_video_get_control_resp_peak));
+        break;
+    case VIRTIO_VIDEO_CONTROL_PREPEND_SPSPPS_TO_IDR:
+        ctrl_resp_header_mode.hdr.stream_id = cmd->hdr.stream_id;
+        ctrl_resp_header_mode.hdr.type = VIRTIO_VIDEO_RESP_OK_GET_PARAMS;
+
+        ret = v4l2_ioctl_get_control(s->fd, v4l2_control, &value);
+        if (ret < 0) {
+            goto out_err_unlock;
+        }
+
+        ctrl_resp_header_mode.header.prepend_spspps_to_idr = htole32(value);
+
+        vio_cmd->finished = true;
+        send_ctrl_response(vio_cmd, (uint8_t *)&ctrl_resp_header_mode,
+                           sizeof(struct virtio_video_get_control_resp_header_mode));
+        break;
+    case VIRTIO_VIDEO_CONTROL_GOP_SIZE:
+        ctrl_resp_gop_size.hdr.stream_id = cmd->hdr.stream_id;
+        ctrl_resp_gop_size.hdr.type = VIRTIO_VIDEO_RESP_OK_GET_PARAMS;
+
+        ret = v4l2_ioctl_get_control(s->fd, v4l2_control, &value);
+        if (ret < 0) {
+            goto out_err_unlock;
+        }
+
+        ctrl_resp_gop_size.gop.gop = htole32(value);
+
+        vio_cmd->finished = true;
+        send_ctrl_response(vio_cmd, (uint8_t *)&ctrl_resp_gop_size,
+                           sizeof(struct virtio_video_get_control_resp_gop_size));
+        break;
     default:
-        g_critical("Unknown control requested!");
+        g_debug("Unknown control requested!\n");
         goto out_err_unlock;
         break;
     }
@@ -1470,6 +1611,164 @@ out_err_unlock:
 }
 
 static int
+handle_set_control_cmd(struct VuVideo *v, struct vu_video_ctrl_command *vio_cmd)
+{
+    int ret;
+    uint32_t v4l2_control;
+    int32_t value;
+
+    struct virtio_video_control_val_level   *ctl_resp_level;
+    struct virtio_video_control_val_profile *ctl_resp_profile;
+    struct virtio_video_control_val_bitrate *ctl_resp_bitrate;
+    struct virtio_video_control_val_bitrate_mode *ctrl_resp_bitrate_mode;
+    struct virtio_video_control_val_bitrate_peak *ctl_resp_peak;
+    struct virtio_video_control_val_prepend_spspps_to_idr *ctrl_resp_header_mode;
+    struct virtio_video_control_val_gop_size *ctrl_resp_gop_size;
+
+    struct stream *s;
+
+    struct virtio_video_set_control *cmd =
+        (struct virtio_video_set_control *)vio_cmd->cmd_buf;
+
+    s = find_stream(v, cmd->hdr.stream_id);
+    if (!s) {
+        g_debug("%s: stream_id(%d) not found\n", __func__, cmd->hdr.stream_id);
+        return -EINVAL;
+    }
+
+    g_mutex_lock(&s->mutex);
+
+    v4l2_control = virtio_video_control_to_v4l2(le32toh(cmd->control));
+    if (!v4l2_control) {
+        g_debug("no v4l2 control\n");
+        goto out_err_unlock;
+    }
+
+    switch (le32toh(cmd->control)) {
+    case VIRTIO_VIDEO_CONTROL_BITRATE:
+        if (v->v4l2_dev->dev_type == STATEFUL_ENCODER) {
+            ctl_resp_bitrate = (void *)((char *)cmd +
+				 sizeof(struct virtio_video_set_control));
+            value = le32toh(ctl_resp_bitrate->bitrate);
+            g_debug("set birate %d\n",value);
+            ret = v4l2_ioctl_set_control(s->fd, v4l2_control, value);
+            if (ret)
+                g_debug("set v4l2 bitrate error\n");
+
+        } else {
+            g_debug("%s: CONTROL_BITRATE unsupported for decoders!\n", __func__);
+        }
+
+        vio_cmd->finished = true;
+        break;
+    case VIRTIO_VIDEO_CONTROL_PROFILE:
+        if (v->v4l2_dev->dev_type == STATEFUL_ENCODER) {
+            ctl_resp_profile = (void *)((char *)cmd +
+				 sizeof(struct virtio_video_set_control));
+            value = le32toh(ctl_resp_profile->profile);
+            g_debug("set profile %d\n",value);
+            ret = v4l2_ioctl_set_control(s->fd, v4l2_control, value);
+            if (ret)
+                g_debug("set v4l2 bitrate error\n");
+
+        } else {
+            g_debug("%s: CONTROL_BITRATE unsupported for decoders!\n", __func__);
+        }
+
+        vio_cmd->finished = true;
+        break;
+    case VIRTIO_VIDEO_CONTROL_LEVEL:
+        if (v->v4l2_dev->dev_type == STATEFUL_ENCODER) {
+            ctl_resp_level = (void *)((char *)cmd +
+				 sizeof(struct virtio_video_set_control));
+            value = le32toh(ctl_resp_level->level);
+            g_debug("set level %d\n",value);
+            ret = v4l2_ioctl_set_control(s->fd, v4l2_control, value);
+            if (ret)
+                g_debug("set v4l2 bitrate error\n");
+
+        } else {
+            g_debug("%s: CONTROL_BITRATE unsupported for decoders!\n", __func__);
+        }   
+
+        vio_cmd->finished = true;
+        break;
+    case VIRTIO_VIDEO_CONTROL_BITRATE_MODE:  
+        if (v->v4l2_dev->dev_type == STATEFUL_ENCODER) {
+            ctrl_resp_bitrate_mode = (void *)((char *)cmd +
+				 sizeof(struct virtio_video_set_control));
+            value = le32toh(ctrl_resp_bitrate_mode->bitrate_mode);
+            g_debug("set birate mode %d\n",value);
+            ret = v4l2_ioctl_set_control(s->fd, v4l2_control, value);
+            if (ret)
+                g_debug("set v4l2 bitrate error\n");
+
+        } else {
+            g_debug("%s: CONTROL_BITRATE unsupported for decoders!\n", __func__);
+        }  
+
+        vio_cmd->finished = true;
+        break;
+    case VIRTIO_VIDEO_CONTROL_BITRATE_PEAK:
+        if (v->v4l2_dev->dev_type == STATEFUL_ENCODER) {
+            ctl_resp_peak = (void *)((char *)cmd +
+				 sizeof(struct virtio_video_set_control));
+            value = le32toh(ctl_resp_peak->bitrate_peak);
+            g_debug("set peak bitrate %d\n",value);
+            ret = v4l2_ioctl_set_control(s->fd, v4l2_control, value);
+            if (ret)
+                g_debug("set v4l2 bitrate error\n");
+
+        } else {
+            g_debug("%s: CONTROL_BITRATE unsupported for decoders!\n", __func__);
+        }  
+
+        vio_cmd->finished = true;
+        break;
+    case VIRTIO_VIDEO_CONTROL_PREPEND_SPSPPS_TO_IDR:
+        if (v->v4l2_dev->dev_type == STATEFUL_ENCODER) {
+            ctrl_resp_header_mode = (void *)((char *)cmd +
+				 sizeof(struct virtio_video_set_control));
+            value = le32toh(ctrl_resp_header_mode->prepend_spspps_to_idr);
+            g_debug("set sps2idr %d\n",value);
+            ret = v4l2_ioctl_set_control(s->fd, v4l2_control, value);
+            if (ret)
+                g_debug("set v4l2 bitrate error\n");
+
+        } else {
+            g_debug("%s: CONTROL_BITRATE unsupported for decoders!\n", __func__);
+        }          
+
+        vio_cmd->finished = true;
+        break;
+    case VIRTIO_VIDEO_CONTROL_GOP_SIZE:
+       if (v->v4l2_dev->dev_type == STATEFUL_ENCODER) {
+            ctrl_resp_gop_size = (void *)((char *)cmd +
+				 sizeof(struct virtio_video_set_control));
+            value = le32toh(ctrl_resp_gop_size->gop);
+            g_debug("set gop size %d\n",value);
+            ret = v4l2_ioctl_set_control(s->fd, v4l2_control, value);
+            if (ret)
+                g_debug("set v4l2 bitrate error\n");
+
+        } else {
+            g_debug("%s: CONTROL_BITRATE unsupported for decoders!\n", __func__);
+        }          
+
+        vio_cmd->finished = true;
+        break;
+    default:
+        g_debug("Unknown control requested!\n");
+        break;
+    }
+out_err_unlock:
+    send_ctrl_response_nodata(vio_cmd);
+
+    g_mutex_unlock(&s->mutex);
+    return 0;
+}
+
+static int
 handle_query_capability_cmd(struct VuVideo *v,
                             struct vu_video_ctrl_command *cmd)
 {
@@ -1481,17 +1780,13 @@ handle_query_capability_cmd(struct VuVideo *v,
     GByteArray *querycapresp;
 
     /* hdr bswapped already */
-    g_debug("%s: type(0x%x) stream_id(%d) %s", __func__,
-            qcmd->hdr.type, qcmd->hdr.stream_id,
-            vio_queue_name(le32toh(qcmd->queue_type)));
-
     buf_type = get_v4l2_buf_type(le32toh(qcmd->queue_type),
                                  v->v4l2_dev->has_mplane);
 
     /* enumerate formats */
     ret = video_enum_formats(v->v4l2_dev, buf_type, &fmt_l, false);
     if (ret < 0) {
-        g_printerr("video_enum_formats failed");
+        g_debug("video_enum_formats failed\n");
         return ret;
     }
 
@@ -1547,10 +1842,10 @@ vv_process_cmd(VuVideo *video, struct vu_video_ctrl_command *cmd)
         handle_get_control_cmd(video, cmd);
         break;
     case VIRTIO_VIDEO_CMD_SET_CONTROL:
-        g_error("**** VIRTIO_VIDEO_CMD_SET_CONTROL unimplemented!");
+        handle_set_control_cmd(video, cmd);
         break;
     default:
-        g_error("Unknown VIRTIO_VIDEO command!");
+        g_debug("Unknown VIRTIO_VIDEO command!\n");
         break;
     }
 }
@@ -1583,7 +1878,7 @@ video_handle_ctrl(VuDev *dev, int qidx)
                               offset, cmd->cmd_buf, cmd_len);
 
         if (len != cmd_len) {
-            g_warning("%s: command size incorrect %zu vs %zu\n",
+            g_debug("%s: command size incorrect %zu vs %zu\n",
                       __func__, len, cmd_len);
         }
 
@@ -1591,7 +1886,7 @@ video_handle_ctrl(VuDev *dev, int qidx)
         cmd->cmd_hdr = (struct virtio_video_cmd_hdr *) cmd->cmd_buf;
         /* bswap header */
         virtio_video_ctrl_hdr_letoh(cmd->cmd_hdr);
-        g_debug("Received %s cmd", vv_cmd_to_string(cmd->cmd_hdr->type));
+        g_debug("Received %s cmd\n", vv_cmd_to_string(cmd->cmd_hdr->type));
         vv_process_cmd(video, cmd);
     }
 }
@@ -1601,7 +1896,7 @@ video_queue_set_started(VuDev *dev, int qidx, bool started)
 {
     VuVirtq *vq = vu_get_queue(dev, qidx);
 
-    g_debug("queue started %d:%d\n", qidx, started);
+    //g_debug("queue started %d:%d\n", qidx, started);
 
     switch (qidx) {
     case 0:
@@ -1621,8 +1916,6 @@ video_queue_set_started(VuDev *dev, int qidx, bool started)
 static int video_process_msg(VuDev *dev, VhostUserMsg *msg, int *do_reply)
 {
     VuVideo *r = container_of(dev, VuVideo, dev.parent);
-
-    g_debug("%s: msg %d", __func__, msg->request);
 
     switch (msg->request) {
     case VHOST_USER_NONE:
@@ -1655,25 +1948,27 @@ static void video_destroy(VuVideo *v)
 /* Print vhost-user.json backend program capabilities */
 static void print_capabilities(void)
 {
-    printf("{\n");
-    printf("  \"type\": \"misc\"\n");
-    printf("}\n");
+    g_debug("{\n");
+    g_debug("  \"type\": \"misc\"\n");
+    g_debug("}\n");
 }
 
 static gboolean hangup(gpointer user_data)
 {
     GMainLoop *loop = (GMainLoop *) user_data;
-    g_info("%s: caught hangup/quit signal, quitting main loop", __func__);
+    g_debug("%s: caught hangup/quit signal, quitting main loop\n", __func__);
     g_main_loop_quit(loop);
     return true;
 }
 
 int main(int argc, char *argv[])
 {
+	int i;
     GError *error = NULL;
     GOptionContext *context;
     g_autoptr(GSocket) socket = NULL;
     VuVideo video = {  };
+	VuDev *vudev;
 
     context = g_option_context_new("vhost-user emulation of video device");
     g_option_context_add_main_entries(context, options, "vhost-user-video");
@@ -1766,6 +2061,7 @@ int main(int argc, char *argv[])
      * added. As well as catching signals we need to ensure vug_init
      * can add it's GSource watches.
      */
+    stats_init();
 
     video.loop = g_main_loop_new(NULL, FALSE);
     /* catch exit signals */
@@ -1778,6 +2074,13 @@ int main(int argc, char *argv[])
         g_printerr("Failed to initialize libvhost-user-glib.\n");
         exit(EXIT_FAILURE);
     }
+
+    vudev = &video.dev.parent;
+    g_message("vu dev reions %d\n",vudev->nregions);
+    for (i = 0; i < vudev->nregions; i++) {
+       VuDevRegion *r = &vudev->regions[i];
+	   g_message("region %d,qva %lx,gpa %lx,mmap addr %lx,offset %lx",i,r->qva,r->gpa,r->mmap_addr,r->mmap_offset);
+	}
 
     g_message("entering main loop, awaiting messages");
     g_main_loop_run(video.loop);

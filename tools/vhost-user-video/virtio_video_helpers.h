@@ -16,6 +16,7 @@
 #ifndef VIRTIO_VIDEO_HELPERS_H
 #define VIRTIO_VIDEO_HELPERS_H
 
+#include "qemu/osdep.h"
 #include <stdint.h>
 #include "standard-headers/linux/virtio_video.h"
 #include <linux/videodev2.h>
@@ -23,6 +24,9 @@
 #include "libvhost-user.h"
 #include "qemu/uuid.h"
 #include "qemu/queue.h"
+#include "statistics.h"
+
+#define GRANT_DMABUF  1
 
 /*
  * Structure to track internal state of VIDEO Device
@@ -105,6 +109,9 @@ struct stream {
     int fd;
     uint32_t output_bufcount;
     uint32_t capture_bufcount;
+    uint32_t init_seq_flag;
+    int32_t min_buffers_for_capture;
+    void* gntdev_handler;
 };
 
 #define STREAM_STOPPED      1
@@ -112,6 +119,7 @@ struct stream {
 #define STREAM_DRAINING     3
 #define STREAM_DESTROYING   4
 #define STREAM_DESTROYED    5
+#define STREAM_SRC_CHGING   6
 
 /* Structure to track resources */
 
@@ -121,12 +129,20 @@ struct resource {
     struct virtio_video_resource_create vio_resource;
     struct virtio_video_resource_queue vio_res_q;
     struct iovec *iov;
+    uint64_t gpa[8];
     uint32_t iov_count;
     uint32_t v4l2_index;
     struct VuVideoDMABuf *buf;
     enum v4l2_buf_type type;
     struct vu_video_ctrl_command *vio_q_cmd;
     bool queued;
+    int dma_fd;
+    uint32_t ref_count;
+    uint32_t ref[4096];
+    void* gnt_addr;
+    void* gnt_dmabuf_addr;
+    struct stats_events_t dqqbuf;
+    struct stats_events_t qdqbuf;
 };
 
 struct video_format_frame_rates {
