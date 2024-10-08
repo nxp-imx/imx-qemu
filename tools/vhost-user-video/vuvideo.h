@@ -30,6 +30,8 @@ struct resource *find_resource(struct stream *s, uint32_t resource_id,
 
 void send_ctrl_response(struct vu_video_ctrl_command *vio_cmd,
                        uint8_t *resp, size_t resp_len);
+void send_ctrl_response_sync(struct vu_video_ctrl_command *vio_cmd,
+                       uint8_t *resp, size_t resp_len);
 
 void send_ctrl_response_nodata(struct vu_video_ctrl_command *vio_cmd);
 

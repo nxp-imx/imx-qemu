@@ -102,10 +102,11 @@ int v4l2_close(int fd);
 /* ioctl wrappers */
 int v4l2_ioctl_query_control(int fd, uint32_t control, int32_t *value);
 int v4l2_ioctl_get_control(int fd, uint32_t control, int32_t *value);
+int v4l2_ioctl_set_control(int fd, uint32_t control, int32_t value);
 int v4l2_ioctl_reqbuf(int fd, enum v4l2_buf_type type,
                       enum v4l2_memory memory, int *count);
 int v4l2_ioctl_subscribe_event(int fd, uint32_t event_type, uint32_t id);
 
-int v4l2_issue_cmd(int fd,  uint32_t cmd, uint32_t flags);
-
+int v4l2_decoder_issue_cmd(int fd,  uint32_t cmd, uint32_t flags);
+int v4l2_encoder_issue_cmd(int fd,  uint32_t cmd, uint32_t flags);
 #endif
