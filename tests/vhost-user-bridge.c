@@ -38,6 +38,7 @@
 
 #define VHOST_USER_BRIDGE_DEBUG 1
 
+#undef DPRINT
 #define DPRINT(...) \
     do { \
         if (VHOST_USER_BRIDGE_DEBUG) { \
