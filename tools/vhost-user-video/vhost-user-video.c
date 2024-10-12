@@ -33,6 +33,8 @@
 #include <assert.h>
 #include <linux/dma-buf.h>
 
+#include "vuconfig.h"
+
 #include "libvhost-user-glib.h"
 #include "libvhost-user.h"
 #include "libvhost-user-xen.h"
