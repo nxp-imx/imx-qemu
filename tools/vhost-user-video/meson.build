@@ -1,3 +1,4 @@
+if get_option('xen').enabled()
 executable('vhost-user-video', files(
   'vhost-user-video.c', 'v4l2_backend.c', 'virtio_video_helpers.c', 'virtio_video_udmabuf.c', 'statistics.c'),
   dependencies: [qemuutil, glib, gio, vhost_user],
@@ -8,3 +9,4 @@ configure_file(input: '50-qemu-video.json.in',
 	       output: '50-qemu-video.json',
 	       configuration: config_host,
 	       install_dir: qemu_datadir / 'vhost-user')
+endif
