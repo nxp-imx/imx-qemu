@@ -17,7 +17,6 @@
 #include <stdio.h>
 #include <sys/time.h>
 
-#include <glib.h>
 #include <glib/gstdio.h>
 
 #include "statistics.h"

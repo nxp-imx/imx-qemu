@@ -20,7 +20,6 @@
 #include <stddef.h>
 #include <inttypes.h>
 
-#include <glib.h>
 #include <glib/gstdio.h>
 
 #include "standard-headers/linux/virtio_video.h"
