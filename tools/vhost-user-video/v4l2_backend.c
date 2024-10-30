@@ -16,7 +16,6 @@
  */
 #include <linux/videodev2.h>
 
-#include <glib.h>
 #include <glib/gstdio.h>
 
 #include <assert.h>
