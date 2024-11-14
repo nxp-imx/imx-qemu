@@ -97,7 +97,7 @@ bool vu_xen_add_mem_reg(VuDev *dev, VhostUserMsg *vmsg)
     dev_region->size = msg_region->memory_size;
     dev_region->qva = msg_region->userspace_addr;
     dev_region->mmap_offset = msg_region->mmap_offset;
-    dev_region->mmap_addr = vu_xen_foreignmap(domid, dev_region->gpa, dev_region->size); 
+    dev_region->mmap_addr = (uint64_t)vu_xen_foreignmap(domid, dev_region->gpa, dev_region->size);
     if (!dev_region->mmap_addr) {
         DPRINT("foreignmap dom[%d] gpa %"PRId64" %"PRId64"\n",
                domid, dev_region->gpa, dev_region->size);
