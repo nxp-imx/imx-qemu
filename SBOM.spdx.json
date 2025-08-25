@@ -1,0 +1,64 @@
+{
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "spdxVersion": "SPDX-2.3",
+  "creationInfo": {
+    "created": "2025-08-24T08:08:27Z",
+    "creators": [
+      "Organization: NXP"
+    ],
+    "licenseListVersion": "3.20"
+  },
+  "name": "imx-jailhouse-LF_6.12.34_2.1.0",
+  "dataLicense": "CC0-1.0",
+  "documentNamespace": "https://nxp.com/spdx/816e3a18-2909-4a28-8363-8d68dfd28458",
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-package-816e3a18-2909-4a28-8363-8d68dfd28458",
+      "name": "imx-jailhouse",
+      "versionInfo": "LF_6.12.34_2.1.0",
+      "licenseConcluded": "(GPL-2.0-only)",
+      "licenseDeclared": "(GPL-2.0-only)",
+      "downloadLocation": "https://github.com/nxp-imx/imx-jailhouse -b lf-6.12.34-2.1.0",
+      "originator": "Organization: NXP",
+      "supplier": "NOASSERTION",
+      "externalRefs": [],
+      "filesAnalyzed": false
+    },
+    {
+      "SPDXID": "SPDXRef-package-ce5ae257-fc8f-4533-a77f-88ae35278f9b",
+      "name": "Jailhouse",
+      "versionInfo": "v0.12",
+      "licenseConcluded": "GPL-2.0-only",
+      "licenseDeclared": "(BSD-2-Clause AND GPL-2.0-only)",
+      "homepage": "https://github.com/siemens/jailhouse",
+      "downloadLocation": "NOASSERTION",
+      "originator": "Organization: siemens",
+      "supplier": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:github/siemens/jailhouse@v0.12",
+          "referenceType": "purl"
+        },
+        {
+          "referenceCategory": "OTHER",
+          "referenceLocator": "822287a8-7b1c-48e3-9589-15c6b816b46f",
+          "referenceType": "BlackDuck-ComponentOrigin"
+        }
+      ],
+      "filesAnalyzed": false
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-package-816e3a18-2909-4a28-8363-8d68dfd28458"
+    },
+    {
+      "spdxElementId": "SPDXRef-package-816e3a18-2909-4a28-8363-8d68dfd28458",
+      "relationshipType": "DYNAMIC_LINK",
+      "relatedSpdxElement": "SPDXRef-package-ce5ae257-fc8f-4533-a77f-88ae35278f9b"
+    }
+  ]
+}
