@@ -7,6 +7,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/units.h"
 #include "qapi/visitor.h"
@@ -131,54 +132,191 @@ static inline void xenpvh_gpex_init(XenPVHMachineState *s,
                                     XenPVHMachineClass *xpc,
                                     MemoryRegion *sysmem)
 {
-    MemoryRegion *ecam_reg;
-    MemoryRegion *mmio_reg;
+    hwaddr base_ecam = s->cfg.pci_ecam.base;
+    hwaddr size_ecam = s->cfg.pci_ecam.size;
+    hwaddr base_mmio = s->cfg.pci_mmio.base;
+    hwaddr size_mmio = s->cfg.pci_mmio.size;
+    hwaddr base_mmio_high = s->cfg.pci_mmio_high.base;
+    hwaddr size_mmio_high = s->cfg.pci_mmio_high.size;
     DeviceState *dev;
+    MemoryRegion *mmio_alias, *mmio_alias_high, *mmio_reg;
+    MemoryRegion *ecam_alias, *ecam_reg;
     int i;
 
-    object_initialize_child(OBJECT(s), "gpex", &s->pci.gpex,
-                            TYPE_GPEX_HOST);
-    dev = DEVICE(&s->pci.gpex);
+    dev = qdev_new(TYPE_GPEX_HOST);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
 
+    /* Map ECAM space */
+    ecam_alias = g_new0(MemoryRegion, 1);
     ecam_reg = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0);
-    memory_region_add_subregion(sysmem, s->cfg.pci_ecam.base, ecam_reg);
+    memory_region_init_alias(ecam_alias, OBJECT(dev), "pcie-ecam",
+                             ecam_reg, 0, size_ecam);
+    memory_region_add_subregion(get_system_memory(), base_ecam, ecam_alias);
 
+    /* Map the MMIO space */
+    mmio_alias = g_new0(MemoryRegion, 1);
     mmio_reg = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 1);
+    memory_region_init_alias(mmio_alias, OBJECT(dev), "pcie-mmio",
+                             mmio_reg, base_mmio, size_mmio);
+    memory_region_add_subregion(get_system_memory(), base_mmio, mmio_alias);
 
-    if (s->cfg.pci_mmio.size) {
-        memory_region_init_alias(&s->pci.mmio_alias, OBJECT(dev), "pcie-mmio",
-                                 mmio_reg,
-                                 s->cfg.pci_mmio.base, s->cfg.pci_mmio.size);
-        memory_region_add_subregion(sysmem, s->cfg.pci_mmio.base,
-                                    &s->pci.mmio_alias);
-    }
+    /* Map the MMIO_HIGH space */
+    mmio_alias_high = g_new0(MemoryRegion, 1);
+    memory_region_init_alias(mmio_alias_high, OBJECT(dev), "pcie-mmio-high",
+                             mmio_reg, base_mmio_high, size_mmio_high);
+    memory_region_add_subregion(get_system_memory(), base_mmio_high,
+                                mmio_alias_high);
 
-    if (s->cfg.pci_mmio_high.size) {
-        memory_region_init_alias(&s->pci.mmio_high_alias, OBJECT(dev),
-                "pcie-mmio-high",
-                mmio_reg, s->cfg.pci_mmio_high.base, s->cfg.pci_mmio_high.size);
-        memory_region_add_subregion(sysmem, s->cfg.pci_mmio_high.base,
-                &s->pci.mmio_high_alias);
-    }
-
-    /*
-     * PVH implementations with PCI enabled must provide set_pci_intx_irq()
-     * and optionally an implementation of set_pci_link_route().
-     */
-    assert(xpc->set_pci_intx_irq);
-
+    /* Legacy PCI interrupts (#INTA - #INTD) */
     for (i = 0; i < PCI_NUM_PINS; i++) {
         qemu_irq irq = qemu_allocate_irq(xpc->set_pci_intx_irq, s, i);
 
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), i, irq);
         gpex_set_irq_num(GPEX_HOST(dev), i, s->cfg.pci_intx_irq_base + i);
-        if (xpc->set_pci_link_route) {
-            xpc->set_pci_link_route(i, s->cfg.pci_intx_irq_base + i);
-        }
     }
+
+    DPRINTF("Created PCIe host bridge\n");
 }
 
+static int xen_get_pcie_params(XenPVHMachineState *s)
+{
+    char path[128], *value = NULL, **entries = NULL;
+    unsigned int len, tmp;
+    int rc = -1;
+
+    snprintf(path, sizeof(path), "device-model/%d/virtio_pci_host",
+             xen_domid);
+    DPRINTF("%s %s\n", __func__, path);
+    entries = xs_directory(s->ioreq.xenstore, XBT_NULL, path, &len);
+    DPRINTF("%s %s ccccccc\n", __func__, path);
+    if (entries == NULL) {
+        error_report("xenpv: 'virtio_pci_host' dir is not present");
+        return -1;
+    }
+    DPRINTF("%s 1\n", __func__);
+    free(entries);
+    if (len != 9) {
+        error_report("xenpv: Unexpected num of entries in 'virtio_pci_host' dir");
+        goto out;
+    }
+
+    snprintf(path, sizeof(path), "device-model/%d/virtio_pci_host/id",
+             xen_domid);
+    DPRINTF("%s %s 2\n", __func__, path);
+    value = xs_read(s->ioreq.xenstore, XBT_NULL, path, &len);
+    if (qemu_strtoui(value, NULL, 10, &tmp)) {
+        error_report("xenpv: Failed to get 'virtio_pci_host/id' prop");
+        goto out;
+    }
+    DPRINTF("%s %s 3\n", __func__, path);
+    free(value);
+    value = NULL;
+    if (tmp > 0xffff) {
+        error_report("xenpv: Wrong 'virtio_pci_host/id' value %u", tmp);
+        goto out;
+    }
+    xen_pci_segment = tmp;
+    DPRINTF("PCIe host bridge: id (xen_pci_segment) %u\n", xen_pci_segment);
+
+    snprintf(path, sizeof(path), "device-model/%d/virtio_pci_host/ecam_base",
+             xen_domid);
+    value = xs_read(s->ioreq.xenstore, XBT_NULL, path, &len);
+    if (qemu_strtou64(value, NULL, 16, &s->cfg.pci_ecam.base)) {
+        error_report("xenpv: Failed to get 'virtio_pci_host/ecam_base' prop");
+        goto out;
+    }
+    free(value);
+    value = NULL;
+    DPRINTF("PCIe host bridge: ecam_base 0x%lx\n", s->cfg.pci_ecam.base);
+
+    snprintf(path, sizeof(path), "device-model/%d/virtio_pci_host/ecam_size",
+             xen_domid);
+    value = xs_read(s->ioreq.xenstore, XBT_NULL, path, &len);
+    if (qemu_strtou64(value, NULL, 16, &s->cfg.pci_ecam.size)) {
+        error_report("xenpv: Failed to get 'virtio_pci_host/ecam_size' prop");
+        goto out;
+    }
+    free(value);
+    value = NULL;
+    DPRINTF("PCIe host bridge: ecam_size 0x%lx\n", s->cfg.pci_ecam.size);
+
+    snprintf(path, sizeof(path), "device-model/%d/virtio_pci_host/mem_base",
+             xen_domid);
+    value = xs_read(s->ioreq.xenstore, XBT_NULL, path, &len);
+    if (qemu_strtou64(value, NULL, 16, &s->cfg.pci_mmio.base)) {
+        error_report("xenpv: Failed to get 'virtio_pci_host/mem_base' prop");
+        goto out;
+    }
+    free(value);
+    value = NULL;
+    DPRINTF("PCIe host bridge: mem_base 0x%lx\n", s->cfg.pci_mmio.base);
+
+    snprintf(path, sizeof(path), "device-model/%d/virtio_pci_host/mem_size",
+             xen_domid);
+    value = xs_read(s->ioreq.xenstore, XBT_NULL, path, &len);
+    if (qemu_strtou64(value, NULL, 16, &s->cfg.pci_mmio.size)) {
+        error_report("xenpv: Failed to get 'virtio_pci_host/mem_size' prop");
+        goto out;
+    }
+    free(value);
+    value = NULL;
+    DPRINTF("PCIe host bridge: mem_size 0x%lx\n", s->cfg.pci_mmio.size);
+
+    snprintf(path, sizeof(path), "device-model/%d/virtio_pci_host/prefetch_mem_base",
+             xen_domid);
+    value = xs_read(s->ioreq.xenstore, XBT_NULL, path, &len);
+    if (qemu_strtou64(value, NULL, 16, &s->cfg.pci_mmio_high.base)) {
+        error_report("xenpv: Failed to get 'virtio_pci_host/prefetch_mem_base' prop");
+        goto out;
+    }
+    free(value);
+    value = NULL;
+    DPRINTF("PCIe host bridge: prefetch_mem_base 0x%lx\n", s->cfg.pci_mmio_high.base);
+
+    snprintf(path, sizeof(path), "device-model/%d/virtio_pci_host/prefetch_mem_size",
+             xen_domid);
+    value = xs_read(s->ioreq.xenstore, XBT_NULL, path, &len);
+    if (qemu_strtou64(value, NULL, 16, &s->cfg.pci_mmio_high.size)) {
+        error_report("xenpv: Failed to get 'virtio_pci_host/prefetch_mem_size' prop");
+        goto out;
+    }
+    free(value);
+    value = NULL;
+    DPRINTF("PCIe host bridge: prefetch_mem_size 0x%lx\n", s->cfg.pci_mmio_high.size);
+
+    snprintf(path, sizeof(path), "device-model/%d/virtio_pci_host/irq_first",
+             xen_domid);
+    value = xs_read(s->ioreq.xenstore, XBT_NULL, path, &len);
+    if (qemu_strtoui(value, NULL, 10, &s->cfg.pci_intx_irq_base)) {
+        error_report("xenpv: Failed to get 'virtio_pci_host/irq_first' prop");
+        goto out;
+    }
+    free(value);
+    value = NULL;
+    DPRINTF("PCIe host bridge: irq_first %u\n", s->cfg.pci_intx_irq_base);
+
+    snprintf(path, sizeof(path), "device-model/%d/virtio_pci_host/num_irqs", xen_domid);
+    value = xs_read(s->ioreq.xenstore, XBT_NULL, path, &len);
+    if (qemu_strtoui(value, NULL, 10, &tmp)) {
+        error_report("xenpv: Failed to get 'virtio_pci_host/num_irqs' prop");
+        goto out;
+    }
+    free(value);
+    value = NULL;
+    if (tmp != PCI_NUM_PINS) {
+        error_report("xenpv: Wrong 'virtio_pci_host/num_irqs' value %u", tmp);
+        goto out;
+    }
+    DPRINTF("PCIe host bridge: num_irqs %u\n", tmp);
+
+    rc = 0;
+out:
+    if (value)
+        free(value);
+
+    return rc;
+}
+ 
 static void xen_pvh_init(MachineState *ms)
 {
     XenPVHMachineState *s = XEN_PVH_MACHINE(ms);
@@ -201,6 +339,8 @@ static void xen_pvh_init(MachineState *ms)
         xen_create_virtio_mmio_devices(s);
     }
 
+    xen_get_pcie_params(s);
+
 #ifdef CONFIG_TPM
     if (xpc->has_tpm) {
         if (s->cfg.tpm.base) {
@@ -215,7 +355,7 @@ static void xen_pvh_init(MachineState *ms)
     if (s->cfg.pci_ecam.size) {
         if (s->cfg.pci_ecam.size != 256 * MiB) {
             error_report("pci-ecam-size only supports values 0 or 0x10000000");
-            exit(EXIT_FAILURE);
+            //exit(EXIT_FAILURE);
         }
         if (!s->cfg.pci_intx_irq_base) {
             error_report("PCI enabled but pci-intx-irq-base not set");

@@ -431,6 +431,8 @@ static inline void xen_unmap_io_section(domid_t dom,
                                                     0, start_addr, end_addr);
 }
 
+extern uint16_t xen_pci_segment;
+
 static inline void xen_map_pcidev(domid_t dom,
                                   ioservid_t ioservid,
                                   PCIDevice *pci_dev)
@@ -441,7 +443,8 @@ static inline void xen_map_pcidev(domid_t dom,
 
     trace_xen_map_pcidev(ioservid, pci_dev_bus_num(pci_dev),
                          PCI_SLOT(pci_dev->devfn), PCI_FUNC(pci_dev->devfn));
-    xendevicemodel_map_pcidev_to_ioreq_server(xen_dmod, dom, ioservid, 0,
+    xendevicemodel_map_pcidev_to_ioreq_server(xen_dmod, dom, ioservid,
+                                              xen_pci_segment,
                                               pci_dev_bus_num(pci_dev),
                                               PCI_SLOT(pci_dev->devfn),
                                               PCI_FUNC(pci_dev->devfn));
@@ -457,7 +460,8 @@ static inline void xen_unmap_pcidev(domid_t dom,
 
     trace_xen_unmap_pcidev(ioservid, pci_dev_bus_num(pci_dev),
                            PCI_SLOT(pci_dev->devfn), PCI_FUNC(pci_dev->devfn));
-    xendevicemodel_unmap_pcidev_from_ioreq_server(xen_dmod, dom, ioservid, 0,
+    xendevicemodel_unmap_pcidev_from_ioreq_server(xen_dmod, dom, ioservid,
+                                                  xen_pci_segment,
                                                   pci_dev_bus_num(pci_dev),
                                                   PCI_SLOT(pci_dev->devfn),
                                                   PCI_FUNC(pci_dev->devfn));
