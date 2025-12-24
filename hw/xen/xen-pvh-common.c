@@ -516,7 +516,7 @@ static void xen_pvh_class_init(ObjectClass *oc, const void *data)
     mc->init = xen_pvh_init;
 
     mc->desc = "Xen PVH machine";
-    mc->max_cpus = 1;
+    mc->max_cpus = GUEST_MAX_VCPUS;
     mc->default_machine_opts = "accel=xen";
     /* Set to zero to make sure that the real ram size is passed. */
     mc->default_ram_size = 0;
