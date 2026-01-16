@@ -475,8 +475,7 @@ uint8_t *xen_map_cache(MemoryRegion *mr,
          * QEMU generally doesn't expect these mappings to ever fail, so
          * if this happens we report an error message and abort().
          */
-        error_report("Tried to access a grant reference without mapping it.");
-        abort();
+        error_report("Tried to access a grant reference without mapping it. mr:%s", mr->name);
     }
 
     mapcache_lock(mc);
