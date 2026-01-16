@@ -23,12 +23,11 @@ typedef struct VHostUserVIDEOPCI VHostUserVIDEOPCI;
 #define VHOST_USER_VIDEO_PCI(obj) \
         OBJECT_CHECK(VHostUserVIDEOPCI, (obj), TYPE_VHOST_USER_VIDEO_PCI)
 
-static Property vuvideo_pci_properties[] = {
+static const Property vuvideo_pci_properties[] = {
     DEFINE_PROP_BIT("ioeventfd", VirtIOPCIProxy, flags,
                     VIRTIO_PCI_FLAG_USE_IOEVENTFD_BIT, true),
     DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors,
                        DEV_NVECTORS_UNSPECIFIED),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
 static void vuvideo_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
@@ -44,7 +43,7 @@ static void vuvideo_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
     object_property_set_bool(OBJECT(vdev), "realized", true, errp);
 }
 
-static void vuvideo_pci_class_init(ObjectClass *klass, void *data)
+static void vuvideo_pci_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtioPCIClass *k = VIRTIO_PCI_CLASS(klass);

@@ -117,17 +117,18 @@ static void vhost_user_video_stop(VirtIODevice *vdev)
     vhost_dev_disable_notifiers(&video->vhost_dev, vdev);
 }
 
-static void vhost_user_video_set_status(VirtIODevice *vdev, uint8_t status)
+static int vhost_user_video_set_status(VirtIODevice *vdev, uint8_t status)
 {
     VHostUserVIDEO *video = VHOST_USER_VIDEO(vdev);
     bool should_start = status & VIRTIO_CONFIG_S_DRIVER_OK;
 
     if (!vdev->vm_running) {
         should_start = false;
+        return -1;
     }
 
     if (video->vhost_dev.started == should_start) {
-        return;
+        return 0;
     }
 
     if (should_start) {
@@ -135,6 +136,8 @@ static void vhost_user_video_set_status(VirtIODevice *vdev, uint8_t status)
     } else {
         vhost_user_video_stop(vdev);
     }
+
+    return 0;
 }
 
 static uint64_t vhost_user_video_get_features(VirtIODevice *vdev,
@@ -381,13 +384,12 @@ static const VMStateDescription vhost_user_video_vmstate = {
     .unmigratable = 1,
 };
 
-static Property vhost_user_video_properties[] = {
+static const Property vhost_user_video_properties[] = {
     DEFINE_PROP_CHR("chardev", VHostUserVIDEO, conf.chardev),
     DEFINE_PROP_STRING("dev_type", VHostUserVIDEO, conf.type),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void vhost_user_video_class_init(ObjectClass *klass, void *data)
+static void vhost_user_video_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);

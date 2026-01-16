@@ -21,7 +21,7 @@
         OBJECT_CHECK(VHostUserVIDEO, (obj), TYPE_VHOST_USER_VIDEO)
 
 typedef struct {
-    CharBackend chardev;
+    CharFrontend chardev;
     char *type;
     struct virtio_video_config config;
 } VHostUserVIDEOConf;
