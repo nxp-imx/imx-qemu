@@ -76,8 +76,7 @@ static void xen_arm_machine_class_init(ObjectClass *oc, const void *data)
      */
     mc->max_cpus = GUEST_MAX_VCPUS;
 
-    /* Xen/ARM does not use buffered IOREQs.  */
-    xpc->handle_bufioreq = HVM_IOREQSRV_BUFIOREQ_OFF;
+    xpc->handle_bufioreq = HVM_IOREQSRV_BUFIOREQ_ATOMIC;
 
     /* PCI INTX delivery.  */
     xpc->set_pci_intx_irq = xen_pvh_set_pci_intx_irq;
