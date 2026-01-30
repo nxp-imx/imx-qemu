@@ -1,0 +1,273 @@
+{
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "spdxVersion": "SPDX-2.3",
+  "creationInfo": {
+    "created": "2026-01-26T02:11:13Z",
+    "creators": [
+      "Organization: NXP"
+    ],
+    "licenseListVersion": "3.26"
+  },
+  "name": "imx-qemu-LF_6.18.2_1.0.0",
+  "dataLicense": "CC0-1.0",
+  "documentNamespace": "https://nxp.com/spdx/b042c569-8552-43db-9769-8c92ad22d707",
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-package-b042c569-8552-43db-9769-8c92ad22d707",
+      "name": "imx-qemu",
+      "versionInfo": "LF_6.18.2_1.0.0",
+      "licenseConcluded": "(GPL-2.0-only)",
+      "licenseDeclared": "(GPL-2.0-only)",
+      "downloadLocation": "https://github.com/nxp-imx/imx-qemu -b lf-6.18.2-1.0.0",
+      "originator": "Organization: NXP",
+      "supplier": "NOASSERTION",
+      "externalRefs": [],
+      "filesAnalyzed": false
+    },
+    {
+      "SPDXID": "SPDXRef-package-6b13fa02-0d78-445f-bb6c-9aabe36b9071",
+      "name": "Linux Kernel",
+      "versionInfo": "6.18.2",
+      "licenseConcluded": "GPL-2.0-only",
+      "licenseDeclared": "GPL-2.0-only",
+      "homepage": "https://kernel.org",
+      "downloadLocation": "NOASSERTION",
+      "originator": "Organization: Linux Kernel",
+      "supplier": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "SECURITY",
+          "referenceLocator": "cpe:2.3:a:linux:kernel:6.18.2:*:*:*:*:*:*:*",
+          "referenceType": "cpe23Type"
+        },
+        {
+          "referenceCategory": "SECURITY",
+          "referenceLocator": "cpe:2.3:a:linux:linux_kernel:6.18.2:*:*:*:*:*:*:*",
+          "referenceType": "cpe23Type"
+        },
+        {
+          "referenceCategory": "SECURITY",
+          "referenceLocator": "cpe:2.3:o:linux:kernel:6.18.2:*:*:*:*:*:*:*",
+          "referenceType": "cpe23Type"
+        },
+        {
+          "referenceCategory": "SECURITY",
+          "referenceLocator": "cpe:2.3:o:linux:linux_kernel:6.18.2:*:*:*:*:*:*:*",
+          "referenceType": "cpe23Type"
+        }
+      ],
+      "filesAnalyzed": false
+    },
+    {
+      "SPDXID": "SPDXRef-package-320777fd-020f-4ca5-8f10-c11dc3f71269",
+      "name": "Meson build system",
+      "versionInfo": "1.2.3",
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "homepage": "http://mesonbuild.com",
+      "downloadLocation": "http://http.debian.net/debian/pool/main/m/meson",
+      "originator": "Organization: debian",
+      "supplier": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "OTHER",
+          "referenceLocator": "04afda13-9bea-4dee-9e1b-f66602f5d955",
+          "referenceType": "BlackDuck-ComponentOrigin"
+        },
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:deb/debian/meson@1.2.3-1?arch=all",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false
+    },
+    {
+      "SPDXID": "SPDXRef-package-ff36afdc-468a-4e86-b90e-f210dabdcc83",
+      "name": "patchew-project/qemu",
+      "versionInfo": "patchew/20230322142132.22909-1-aesteve@redhat.com",
+      "licenseConcluded": "GPL-2.0-only",
+      "licenseDeclared": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "originator": "Organization: patchew-project/qemu",
+      "supplier": "NOASSERTION",
+      "externalRefs": [],
+      "filesAnalyzed": false
+    },
+    {
+      "SPDXID": "SPDXRef-package-4dcb938a-40f0-4abe-8c60-3952a30b5337",
+      "name": "py3-tomli",
+      "versionInfo": "2.0.1",
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "downloadLocation": "NOASSERTION",
+      "originator": "Organization: alpine",
+      "supplier": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "OTHER",
+          "referenceLocator": "626aa3e8-3be9-40a7-826c-069f594fbaf1",
+          "referenceType": "BlackDuck-ComponentOrigin"
+        },
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:apk/alpine/py3-tomli@2.0.1-r4?arch=noarch",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false
+    },
+    {
+      "SPDXID": "SPDXRef-package-c1b5ef57-39fc-4964-b84c-862e154da373",
+      "name": "QEMU",
+      "versionInfo": "v9.0.2",
+      "licenseConcluded": "GPL-2.0-only",
+      "licenseDeclared": "GPL-2.0-only",
+      "homepage": "http://www.qemu.org/",
+      "downloadLocation": "NOASSERTION",
+      "originator": "Organization: qemu",
+      "supplier": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "OTHER",
+          "referenceLocator": "50393fef-ff0b-420e-b204-16d0c84e537f",
+          "referenceType": "BlackDuck-ComponentOrigin"
+        },
+        {
+          "referenceCategory": "SECURITY",
+          "referenceLocator": "cpe:2.3:a:qemu:qemu:9.0.2:*:*:*:*:*:*:*",
+          "referenceType": "cpe23Type"
+        },
+        {
+          "referenceCategory": "SECURITY",
+          "referenceLocator": "cpe:2.3:a:xen:qemu:9.0.2:*:*:*:*:*:*:*",
+          "referenceType": "cpe23Type"
+        },
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:github/qemu/qemu@v9.0.2",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false
+    },
+    {
+      "SPDXID": "SPDXRef-package-87317805-9a46-4e43-b1d9-3d8ea243a0e2",
+      "name": "qemu-system-sparc64",
+      "versionInfo": "9.1.2",
+      "licenseConcluded": "GPL-2.0-only",
+      "licenseDeclared": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "originator": "Organization: alpine",
+      "supplier": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "OTHER",
+          "referenceLocator": "d8b7f017-aa36-450d-b7bc-113de585c67c",
+          "referenceType": "BlackDuck-ComponentOrigin"
+        },
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:apk/alpine/qemu-sparc64-firmware@9.1.2-r1?arch=riscv64",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false
+    },
+    {
+      "SPDXID": "SPDXRef-package-4fde469b-e30d-432d-ab04-c832fd288097",
+      "name": "SeaBIOS",
+      "versionInfo": "1.8.2",
+      "licenseConcluded": "GPL-2.0-or-later",
+      "licenseDeclared": "(GPL-2.0-or-later OR LGPL-2.0-or-later OR LGPL-3.0-or-later)",
+      "homepage": "http://www.coreboot.org/SeaBIOS",
+      "downloadLocation": "http://archive.ubuntu.com/ubuntu/ubuntu/pool/main/s/seabios",
+      "originator": "Organization: ubuntu",
+      "supplier": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "OTHER",
+          "referenceLocator": "9b5b9db6-dec3-44ae-ba74-0b95e6529488",
+          "referenceType": "BlackDuck-ComponentOrigin"
+        },
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:deb/ubuntu/seabios@1.8.2-1ubuntu1?arch=all",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false
+    },
+    {
+      "SPDXID": "SPDXRef-package-da9e4c24-8074-4d0b-a5d5-6c83fb5389aa",
+      "name": "tomli",
+      "versionInfo": "2.0.1",
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "homepage": "https://github.com/hukkin/tomli",
+      "downloadLocation": "https://pypi.org/project/tomli/2.0.1",
+      "originator": "Organization: pypi",
+      "supplier": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "OTHER",
+          "referenceLocator": "82c157e7-f953-4281-aea9-1052347909f7",
+          "referenceType": "BlackDuck-ComponentOrigin"
+        },
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/tomli@2.0.1",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-package-b042c569-8552-43db-9769-8c92ad22d707"
+    },
+    {
+      "spdxElementId": "SPDXRef-package-b042c569-8552-43db-9769-8c92ad22d707",
+      "relationshipType": "DYNAMIC_LINK",
+      "relatedSpdxElement": "SPDXRef-package-320777fd-020f-4ca5-8f10-c11dc3f71269"
+    },
+    {
+      "spdxElementId": "SPDXRef-package-b042c569-8552-43db-9769-8c92ad22d707",
+      "relationshipType": "DYNAMIC_LINK",
+      "relatedSpdxElement": "SPDXRef-package-4dcb938a-40f0-4abe-8c60-3952a30b5337"
+    },
+    {
+      "spdxElementId": "SPDXRef-package-b042c569-8552-43db-9769-8c92ad22d707",
+      "relationshipType": "DYNAMIC_LINK",
+      "relatedSpdxElement": "SPDXRef-package-4fde469b-e30d-432d-ab04-c832fd288097"
+    },
+    {
+      "spdxElementId": "SPDXRef-package-b042c569-8552-43db-9769-8c92ad22d707",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-package-6b13fa02-0d78-445f-bb6c-9aabe36b9071"
+    },
+    {
+      "spdxElementId": "SPDXRef-package-b042c569-8552-43db-9769-8c92ad22d707",
+      "relationshipType": "DYNAMIC_LINK",
+      "relatedSpdxElement": "SPDXRef-package-87317805-9a46-4e43-b1d9-3d8ea243a0e2"
+    },
+    {
+      "spdxElementId": "SPDXRef-package-b042c569-8552-43db-9769-8c92ad22d707",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-package-c1b5ef57-39fc-4964-b84c-862e154da373"
+    },
+    {
+      "spdxElementId": "SPDXRef-package-b042c569-8552-43db-9769-8c92ad22d707",
+      "relationshipType": "DYNAMIC_LINK",
+      "relatedSpdxElement": "SPDXRef-package-da9e4c24-8074-4d0b-a5d5-6c83fb5389aa"
+    },
+    {
+      "spdxElementId": "SPDXRef-package-b042c569-8552-43db-9769-8c92ad22d707",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-package-ff36afdc-468a-4e86-b90e-f210dabdcc83"
+    }
+  ]
+}
