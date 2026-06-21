@@ -459,8 +459,8 @@ typedef uint64_t xen_callback_t;
 #define GUEST_VPCI_PREFETCH_MEM_ADDR        xen_mk_ullong(0x100000000)
 #define GUEST_VPCI_PREFETCH_MEM_SIZE        xen_mk_ullong(0x100000000)
 
-#define GUEST_RAM1_BASE   xen_mk_ullong(0x0200000000) /* 1016GB of RAM @ 8GB */
-#define GUEST_RAM1_SIZE   xen_mk_ullong(0xfe00000000)
+#define GUEST_RAM1_BASE   xen_mk_ullong(0x0400000000) /* 1016GB of RAM @ 8GB */
+#define GUEST_RAM1_SIZE   xen_mk_ullong(0xfc00000000)
 
 #define GUEST_RAM_BASE    GUEST_RAM0_BASE /* Lowest RAM address */
 /* Largest amount of actual RAM, not including holes */
