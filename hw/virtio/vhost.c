@@ -590,6 +590,10 @@ static bool vhost_section(struct vhost_dev *dev, MemoryRegionSection *section)
         }
 
         if (xen_enabled()) {
+            if (xen_mr_is_grants(mr)) {
+                trace_vhost_reject_section(mr->name, 4);
+                return false;
+            }
             trace_vhost_section(mr->name);
             return true;
         }
