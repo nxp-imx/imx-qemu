@@ -4,4 +4,5 @@ have_virtiovideo = (host_os == 'linux' and
 
 if have_virtiovideo
   subdir('vhost-user-video')
+  subdir('vhost-user-media')
 endif
