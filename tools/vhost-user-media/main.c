@@ -3,7 +3,7 @@
  * Vhost-user-media main entry point.
  * Uses libvhost-user-glib to interface with QEMU.
  *
- * Copyright 2025 NXP
+ * Copyright 2025-2026 NXP
  */
 
 #include <assert.h>
@@ -39,31 +39,44 @@ struct vu_media_device {
     /* Event queue state */
     VuVirtq *eventq;
     GList *event_bufs; /* Available event buffer descriptors */
+
+    /*
+     * Events produced while the guest's event virtqueue had no available
+     * buffer. They must not be dropped (e.g. a DQBUF event carrying
+     * V4L2_BUF_FLAG_LAST): losing one wedges the guest pipeline waiting for
+     * EOS. Queued here in FIFO order and flushed once the guest replenishes
+     * the eventq.
+     */
+    GQueue *pending_events;
+};
+
+/* A single event awaiting an available eventq buffer. */
+struct pending_event {
+    size_t len;
+    uint8_t data[];
 };
 
 static struct vu_media_device vu_media;
 
 /*
- * Send an event to the guest via the event virtqueue.
+ * Try to deliver one event into an available eventq buffer.
+ * Returns true if delivered, false if the eventq had no available buffer.
  */
-static void vu_media_send_event(struct vhost_user_media *m,
-                                const void *event, size_t event_len)
+static bool vu_media_deliver_event(struct vu_media_device *dev,
+                                   const void *event, size_t event_len)
 {
-    struct vu_media_device *dev = &vu_media;
     VuDev *vudev = &dev->dev.parent;
     VuVirtq *vq = vu_get_queue(vudev, 1); /* eventq is queue index 1 */
     VuVirtqElement *elem;
+    size_t written = 0;
     int i;
 
     /* Pop an available descriptor from the event queue */
     elem = vu_queue_pop(vudev, vq, sizeof(VuVirtqElement));
-    if (!elem) {
-        g_warning("No event buffer available on eventq");
-        return;
-    }
+    if (!elem)
+        return false;
 
     /* Write the event into the device-writable descriptor */
-    size_t written = 0;
     for (i = 0; i < elem->in_num && written < event_len; i++) {
         size_t chunk = event_len - written;
         if (chunk > elem->in_sg[i].iov_len)
@@ -77,6 +90,52 @@ static void vu_media_send_event(struct vhost_user_media *m,
     vu_queue_push(vudev, vq, elem, written);
     vu_queue_notify(vudev, vq);
     g_free(elem);
+    return true;
+}
+
+/*
+ * Flush events that were queued while the eventq had no available buffer.
+ * Delivers in FIFO order and stops as soon as the eventq runs dry again so
+ * ordering is preserved.
+ */
+static void vu_media_flush_pending_events(struct vu_media_device *dev)
+{
+    while (!g_queue_is_empty(dev->pending_events)) {
+        struct pending_event *pe = g_queue_peek_head(dev->pending_events);
+
+        if (!vu_media_deliver_event(dev, pe->data, pe->len))
+            break; /* still no buffer; keep the rest queued in order */
+
+        g_queue_pop_head(dev->pending_events);
+        g_free(pe);
+    }
+}
+
+/*
+ * Send an event to the guest via the event virtqueue.
+ *
+ * Events must never be dropped: losing a DQBUF event that carries
+ * V4L2_BUF_FLAG_LAST wedges the guest pipeline waiting for EOS. If the eventq
+ * has no available buffer (or events are already queued and must stay in
+ * order), stash the event and flush it once the guest replenishes the eventq.
+ */
+static void vu_media_send_event(struct vhost_user_media *m,
+                                const void *event, size_t event_len)
+{
+    struct vu_media_device *dev = &vu_media;
+
+    /* Preserve order: if events are already pending, this one goes behind. */
+    if (g_queue_is_empty(dev->pending_events) &&
+        vu_media_deliver_event(dev, event, event_len))
+        return;
+
+    struct pending_event *pe = g_malloc(sizeof(*pe) + event_len);
+    pe->len = event_len;
+    memcpy(pe->data, event, event_len);
+    g_queue_push_tail(dev->pending_events, pe);
+
+    /* The guest may already have buffers waiting; try to drain now. */
+    vu_media_flush_pending_events(dev);
 }
 
 /*
@@ -144,12 +203,13 @@ static void vu_media_handle_commandq(VuDev *vudev, int qidx)
 
 /*
  * Handle the event queue (queue index 1).
- * The guest sends us empty buffers that we fill with events later.
- * We don't need to do anything here - buffers are consumed by send_event.
+ * The guest sends us empty buffers that we fill with events later. When it
+ * replenishes the eventq, flush any events that were stashed because no buffer
+ * was available at the time they were produced.
  */
 static void vu_media_handle_eventq(VuDev *vudev, int qidx)
 {
-    /* Nothing to do - event buffers are consumed on demand */
+    vu_media_flush_pending_events(&vu_media);
 }
 
 static void vu_media_queue_set_started(VuDev *vudev, int qidx, bool started)
@@ -240,7 +300,7 @@ session_poll_callback(gint fd, GIOCondition condition,
 {
     struct media_session *s = user_data;
 
-    vhost_media_poll_session(&vu_media.media, s);
+    vhost_media_poll_session(&vu_media.media, s, condition);
     return G_SOURCE_CONTINUE;
 }
 
@@ -251,7 +311,8 @@ static void vu_media_register_poll(struct vhost_user_media *m,
                                    struct media_session *s)
 {
     s->poll_source_id = g_unix_fd_add(s->v4l2_fd,
-                                      G_IO_IN | G_IO_PRI,
+                                      G_IO_IN | G_IO_OUT | G_IO_PRI |
+                                      G_IO_ERR | G_IO_HUP,
                                       session_poll_callback, s);
     g_debug("Registered poll for session %u (fd=%d, source=%u)",
             s->id, s->v4l2_fd, s->poll_source_id);
@@ -305,6 +366,8 @@ int main(int argc, char *argv[])
     vu_media.media.v4l2_device = v4l2_device;
     vu_media.media.send_event = vu_media_send_event;
     vu_media.media.register_poll = vu_media_register_poll;
+
+    vu_media.pending_events = g_queue_new();
 
     /* Open Xen grant device for dma-buf import/export */
     vu_media.media.gntdev_handle = xengnttab_open(NULL, 0);
@@ -370,6 +433,10 @@ int main(int argc, char *argv[])
         struct media_session *s = vu_media.media.sessions->data;
         vhost_media_destroy_session(&vu_media.media, s);
     }
+
+    /* Drain and free the grant-release worker pool (waits for pending jobs) */
+    if (vu_media.media.grant_release_pool)
+        g_thread_pool_free(vu_media.media.grant_release_pool, FALSE, TRUE);
 
     /* Close Xen grant device */
     if (vu_media.media.gntdev_handle)

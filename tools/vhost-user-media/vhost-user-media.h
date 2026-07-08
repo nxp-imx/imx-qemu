@@ -2,7 +2,7 @@
 /*
  * Vhost-user-media daemon header.
  *
- * Copyright 2025 NXP
+ * Copyright 2025-2026 NXP
  */
 
 #ifndef VHOST_USER_MEDIA_H
@@ -28,6 +28,14 @@ struct media_mmap_entry {
     uint32_t grant_ref_header; /* First grant ref (refs[0]) */
     uint32_t grant_ref_count;  /* Number of grant refs */
     uint32_t *refs;            /* Full grant ref array (grant_ref_count entries) */
+    /*
+     * Superseded by a REQBUFS reallocation: the host buffer this maps was
+     * freed/detached from the queue, so this entry must not be reused for a
+     * new MMAP of the same v4l2_offset. Its grant refs are still held (the
+     * guest may keep a stale mapping) and released only on the matching
+     * MUNMAP.
+     */
+    bool stale;
 };
 
 /*
@@ -69,6 +77,16 @@ struct vhost_user_media {
     void *gntdev_handle;     /* xengnttab_handle */
     uint32_t domu_domid;     /* DomU domain ID for grant refs */
 
+    /*
+     * Worker thread pool used to release imported dma-buf grants off the
+     * main loop. xengnttab_dmabuf_imp_release() blocks for ~2s per buffer
+     * (it tears down the grant mapping of a wave6 dma-buf); doing that
+     * synchronously on the single-threaded GLib main loop during a source
+     * change starves the command virtqueue and makes the guest time out.
+     * Created lazily on first use.
+     */
+    GThreadPool *grant_release_pool;
+
     /* Event sending callback (set by the vhost-user glue) */
     send_event_fn send_event;
 
@@ -108,10 +126,18 @@ void vhost_media_send_v4l2_event(struct vhost_user_media *m,
                                  const struct v4l2_event *event);
 
 /*
+ * Send an error event to the guest.
+ */
+void vhost_media_send_error_event(struct vhost_user_media *m,
+                                  uint32_t session_id,
+                                  uint32_t error_code);
+
+/*
  * Poll a session for dequeued buffers and events.
  */
 void vhost_media_poll_session(struct vhost_user_media *m,
-                              struct media_session *s);
+                              struct media_session *s,
+                              GIOCondition events);
 
 /*
  * Ioctl code lookup.
