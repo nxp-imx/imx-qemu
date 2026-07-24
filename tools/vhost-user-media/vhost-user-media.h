@@ -39,6 +39,25 @@ struct media_mmap_entry {
 };
 
 /*
+ * A dma-buf the backend exported from a guest buffer's grant references, for a
+ * V4L2_MEMORY_DMABUF buffer plane. The guest imports one of its own dma-bufs,
+ * grants its pages to this (backend) domain and sends the grant references once
+ * with a DMABUF_ATTACH command carrying a guest-assigned resource_id. We turn
+ * them into a local dma-buf (xengnttab_dmabuf_exp_from_refs) and remember it
+ * under resource_id; every subsequent QBUF/PREPARE_BUF of that plane carries
+ * only resource_id (in v4l2_buffer m.fd / plane m.fd), which we resolve back to
+ * this local fd to QBUF into the real V4L2 device.
+ *
+ * Keyed by resource_id (guest-assigned, never reused within a session). The
+ * export lives from DMABUF_ATTACH until DMABUF_DETACH (or session close), which
+ * mirrors the guest's per-(buffer, plane) import lifetime.
+ */
+struct media_dmabuf_export {
+    uint32_t resource_id;        /* guest-assigned id - key */
+    int dma_fd;                  /* local dma-buf fd from exp_from_refs */
+};
+
+/*
  * A session represents one open() on the V4L2 device.
  */
 struct media_session {
@@ -49,6 +68,18 @@ struct media_session {
     guint poll_source_id;    /* GLib source ID for fd polling (0 if none) */
     bool output_streaming;   /* OUTPUT (bitstream) queue has been STREAMON */
     bool output_qbuf_done;   /* At least one buffer QBUF-ed on OUTPUT queue */
+
+    /*
+     * Memory model of each logical queue, as set at REQBUFS time. Defaults to
+     * V4L2_MEMORY_MMAP (host owns the buffers). Set to V4L2_MEMORY_DMABUF when
+     * the guest requests DMABUF and it is allowed, in which case QBUF planes
+     * carry a resource_id resolved to a local dma-buf fd (see struct
+     * media_dmabuf_export).
+     */
+    enum v4l2_memory output_memory;  /* OUTPUT (bitstream) queue memory */
+    enum v4l2_memory capture_memory; /* CAPTURE (frame) queue memory */
+
+    GList *dmabuf_exports;   /* List of media_dmabuf_export, keyed by id */
 };
 
 /*

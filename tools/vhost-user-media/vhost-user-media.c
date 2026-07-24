@@ -47,6 +47,9 @@ static uint32_t next_session_id = 1;
 static void queue_grant_release(struct vhost_user_media *m, int dma_fd,
                                 uint32_t *refs);
 
+static void release_dmabuf_export(struct vhost_user_media *m,
+                                  struct media_dmabuf_export *exp);
+
 static struct media_session *find_session(struct vhost_user_media *m,
                                           uint32_t session_id)
 {
@@ -97,6 +100,12 @@ static struct media_session *create_session(struct vhost_user_media *m)
     s->v4l2_fd = fd;
     s->media = m;
     s->poll_source_id = 0;
+    /*
+     * Queues default to MMAP (host owns the buffers). REQBUFS switches a queue
+     * to DMABUF when the guest requests it and the export path is usable.
+     */
+    s->output_memory = V4L2_MEMORY_MMAP;
+    s->capture_memory = V4L2_MEMORY_MMAP;
 
     m->sessions = g_list_append(m->sessions, s);
 
@@ -139,6 +148,19 @@ void vhost_media_destroy_session(struct vhost_user_media *m,
 
     if (s->v4l2_fd >= 0)
         close(s->v4l2_fd);
+
+    /*
+     * Release any dma-bufs we exported from guest grant references for
+     * V4L2_MEMORY_DMABUF buffers. Closing the v4l2 fd above dropped the
+     * device's references to these buffers, so we are now the only user and
+     * ending the export (which lets the guest end its foreign grants) is safe.
+     */
+    for (GList *l = s->dmabuf_exports; l != NULL; l = l->next) {
+        struct media_dmabuf_export *exp = l->data;
+        release_dmabuf_export(m, exp);
+        g_free(exp);
+    }
+    g_list_free(s->dmabuf_exports);
 
     m->sessions = g_list_remove(m->sessions, s);
     g_free(s);
@@ -214,6 +236,205 @@ static void queue_grant_release(struct vhost_user_media *m, int dma_fd,
 }
 
 /*
+ * V4L2_MEMORY_DMABUF support
+ *
+ * For a DMABUF queue the guest owns the buffers: it imports each of its
+ * dma-bufs, grants the pages to this (backend) domain and sends the grant
+ * references once with a DMABUF_ATTACH command that carries a guest-assigned
+ * resource_id (see handle_cmd_dmabuf_attach). We turn the grant references into
+ * a local dma-buf fd with xengnttab_dmabuf_exp_from_refs() and remember it
+ * under resource_id. Every subsequent QBUF/PREPARE_BUF of that plane carries
+ * only resource_id (in v4l2_buffer m.fd / plane m.fd), which we resolve back to
+ * the local fd and QBUF into the real V4L2 device as V4L2_MEMORY_DMABUF.
+ *
+ * The export is cached on the session keyed by resource_id (guest-assigned,
+ * never reused within a session). It lives from DMABUF_ATTACH until
+ * DMABUF_DETACH, or until session close as a safety net; this mirrors the
+ * guest's per-(buffer, plane) import lifetime.
+ */
+
+/*
+ * Find a cached dma-buf export by its guest-assigned resource id.
+ */
+static struct media_dmabuf_export *
+find_dmabuf_export(struct media_session *s, uint32_t resource_id)
+{
+    for (GList *l = s->dmabuf_exports; l != NULL; l = l->next) {
+        struct media_dmabuf_export *exp = l->data;
+        if (exp->resource_id == resource_id)
+            return exp;
+    }
+    return NULL;
+}
+
+/*
+ * Release a dma-buf we exported from guest grant references.
+ *
+ * Close our local fd first so the exported dma-buf has no user left on our
+ * side, then wait (bounded) for the guest's foreign grants to be released.
+ * Must be called only once the real V4L2 device no longer references the
+ * buffer (the guest sends DETACH only after its REQBUFS has freed the buffer
+ * set on the device, or at session close after the v4l2 fd is closed). Does
+ * not free the entry itself.
+ */
+static void release_dmabuf_export(struct vhost_user_media *m,
+                                  struct media_dmabuf_export *exp)
+{
+    if (exp->dma_fd < 0)
+        return;
+
+    close(exp->dma_fd);
+    /*
+     * Bounded wait so a misbehaving peer cannot wedge us here; ENOENT/timeout
+     * are non-fatal (buffer already released or will be as refs drop).
+     */
+    xengnttab_dmabuf_exp_wait_released((xengnttab_handle *)m->gntdev_handle,
+                                       exp->dma_fd, 1000);
+    exp->dma_fd = -1;
+}
+
+/*
+ * DMABUF_ATTACH: export a local dma-buf from the guest grant references that
+ * follow the command, and cache it under the guest-assigned resource_id.
+ *
+ * The command payload is [cmd_dmabuf_attach header][uint32_t refs[num_refs]].
+ */
+static void handle_cmd_dmabuf_attach(struct vhost_user_media *m,
+                                     const uint8_t *cmd_buf, size_t cmd_len,
+                                     uint8_t *resp_buf, size_t *resp_len)
+{
+    const struct virtio_media_cmd_dmabuf_attach *cmd =
+        (const struct virtio_media_cmd_dmabuf_attach *)cmd_buf;
+    struct virtio_media_resp_dmabuf_attach *resp =
+        (struct virtio_media_resp_dmabuf_attach *)resp_buf;
+    struct media_dmabuf_export *exp;
+    struct media_session *s;
+    const uint32_t *refs;
+    uint32_t dmabuf_fd = 0;
+    int ret;
+
+    *resp_len = sizeof(*resp);
+    memset(resp, 0, sizeof(*resp));
+
+    if (cmd_len < sizeof(*cmd)) {
+        resp->hdr.status = EINVAL;
+        return;
+    }
+
+    s = find_session(m, cmd->session_id);
+    if (!s) {
+        resp->hdr.status = EINVAL;
+        return;
+    }
+
+    /* The refs array follows the fixed command header. */
+    if (cmd->num_refs == 0 ||
+        cmd->num_refs > (cmd_len - sizeof(*cmd)) / sizeof(uint32_t)) {
+        resp->hdr.status = EINVAL;
+        return;
+    }
+    refs = (const uint32_t *)(cmd_buf + sizeof(*cmd));
+
+    /*
+     * A resource_id is never reused within a session, so an ATTACH for an id
+     * we already know is a guest protocol error; reject it rather than leak
+     * the previous export.
+     */
+    if (find_dmabuf_export(s, cmd->resource_id)) {
+        g_warning("DMABUF_ATTACH: resource_id %u already attached",
+                  cmd->resource_id);
+        resp->hdr.status = EINVAL;
+        return;
+    }
+
+    /*
+     * The third argument is GNTDEV_DMA_FLAG_* (WC/COHERENT), not open(2)
+     * flags. O_CLOEXEC | O_RDWR happens to set GNTDEV_DMA_FLAG_COHERENT
+     * (O_RDWR == 2), forcing the dma_alloc_coherent() backing path (a
+     * physically contiguous allocation of @num_refs pages on Dom0).
+     *
+     * This flag is NOT what caused the DMABUF import failures seen during
+     * bring-up: those came from the guest backing pages themselves
+     * (default_cma_region-uncached fragmenting so grant refs pointed at
+     * non-contiguous pages) and were fixed by moving the guest dma-heap to
+     * reserved-uncached plus per-queue import deduplication in the guest
+     * driver. With those fixes, exports succeed reliably with this flag
+     * unchanged, so it is left as-is.
+     */
+    ret = xengnttab_dmabuf_exp_from_refs((xengnttab_handle *)m->gntdev_handle,
+                                         m->domu_domid, O_CLOEXEC | O_RDWR,
+                                         cmd->num_refs, refs, &dmabuf_fd);
+    if (ret < 0) {
+        g_warning("xengnttab_dmabuf_exp_from_refs failed (%u refs): %s",
+                  cmd->num_refs, strerror(errno));
+        resp->hdr.status = EINVAL;
+        return;
+    }
+
+    exp = g_new0(struct media_dmabuf_export, 1);
+    exp->resource_id = cmd->resource_id;
+    exp->dma_fd = (int)dmabuf_fd;
+    s->dmabuf_exports = g_list_append(s->dmabuf_exports, exp);
+
+    g_debug("DMABUF_ATTACH: resource_id=%u refs=%u -> fd=%d",
+            cmd->resource_id, cmd->num_refs, exp->dma_fd);
+}
+
+/*
+ * DMABUF_DETACH: release the local dma-buf exported for resource_id.
+ */
+static void handle_cmd_dmabuf_detach(struct vhost_user_media *m,
+                                     const uint8_t *cmd_buf, size_t cmd_len,
+                                     uint8_t *resp_buf, size_t *resp_len)
+{
+    const struct virtio_media_cmd_dmabuf_detach *cmd =
+        (const struct virtio_media_cmd_dmabuf_detach *)cmd_buf;
+    struct virtio_media_resp_dmabuf_detach *resp =
+        (struct virtio_media_resp_dmabuf_detach *)resp_buf;
+    struct media_dmabuf_export *exp;
+    struct media_session *s;
+
+    *resp_len = sizeof(*resp);
+    memset(resp, 0, sizeof(*resp));
+
+    if (cmd_len < sizeof(*cmd)) {
+        resp->hdr.status = EINVAL;
+        return;
+    }
+
+    s = find_session(m, cmd->session_id);
+    if (!s) {
+        resp->hdr.status = EINVAL;
+        return;
+    }
+
+    exp = find_dmabuf_export(s, cmd->resource_id);
+    if (!exp) {
+        /* Detaching an unknown resource is a no-op the guest can tolerate. */
+        g_debug("DMABUF_DETACH: unknown resource_id %u", cmd->resource_id);
+        return;
+    }
+
+    release_dmabuf_export(m, exp);
+    s->dmabuf_exports = g_list_remove(s->dmabuf_exports, exp);
+    g_free(exp);
+
+    g_debug("DMABUF_DETACH: resource_id=%u released", cmd->resource_id);
+}
+
+/*
+ * Resolve a DMABUF plane's resource_id to the local dma-buf fd exported for it
+ * at DMABUF_ATTACH time. Returns the fd (>= 0) or -1 if not attached.
+ */
+static int dmabuf_resolve_resource(struct media_session *s,
+                                   uint32_t resource_id)
+{
+    struct media_dmabuf_export *exp = find_dmabuf_export(s, resource_id);
+
+    return exp ? exp->dma_fd : -1;
+}
+
+/*
  * Command handlers
  */
 
@@ -252,14 +473,19 @@ static void handle_cmd_close(struct vhost_user_media *m,
  *
  * The guest sends the descriptor chain as:
  *   device-readable: [v4l2_buffer][v4l2_plane[length]]
+ *                     [dmabuf_plane + refs[]]*   (DMABUF QBUF/PREPARE_BUF only)
  *   device-writable: [resp_header][v4l2_buffer][v4l2_plane[length]]
  *
  * We need to:
  * 1. Parse v4l2_buffer from the payload
  * 2. If multiplanar, parse the planes array that follows
  * 3. Fix up m.planes pointer to point to our local planes array
- * 4. Call the ioctl
- * 5. Write back the updated v4l2_buffer + planes to the response
+ * 4. Select the queue's memory model (MMAP by default, DMABUF if the guest
+ *    set the queue up for it): for a DMABUF QBUF/PREPARE_BUF, resolve each
+ *    plane's appended grant references to a local dma-buf fd and put it in m.fd
+ * 5. Call the ioctl
+ * 6. Write back the updated v4l2_buffer + planes to the response, with the
+ *    guest's original m/fd values restored (never leak our local host fd)
  */
 static void handle_buffer_ioctl(struct vhost_user_media *m,
                                 struct media_session *s,
@@ -273,6 +499,21 @@ static void handle_buffer_ioctl(struct vhost_user_media *m,
     struct v4l2_buffer vbuf;
     struct v4l2_plane planes[VIDEO_MAX_PLANES];
     uint8_t *resp_payload = resp_buf + sizeof(*resp);
+    bool is_mplane;
+    uint32_t nplanes = 1;
+    size_t planes_size = 0;
+    enum v4l2_memory qmem;
+    /*
+     * For a DMABUF QBUF/PREPARE_BUF we replace each plane's m.fd (a guest
+     * resource_id) with our local dma-buf fd for the real ioctl, then restore
+     * the guest's original values before writing the response so we never leak
+     * our local fd. Only these fields are touched, and only when did_substitute
+     * is set -- other memory models (MMAP) must leave m untouched so the
+     * mem_offset the QUERYBUF ioctl fills in reaches the guest intact.
+     */
+    bool did_substitute = false;
+    int orig_plane_fd[VIDEO_MAX_PLANES];
+    int orig_fd = 0;
     int ret;
 
     if (payload_len < sizeof(struct v4l2_buffer)) {
@@ -284,18 +525,22 @@ static void handle_buffer_ioctl(struct vhost_user_media *m,
     /* Copy v4l2_buffer from payload */
     memcpy(&vbuf, payload, sizeof(vbuf));
     memset(planes, 0, sizeof(planes));
+    memset(orig_plane_fd, 0, sizeof(orig_plane_fd));
 
-    if (V4L2_TYPE_IS_MULTIPLANAR(vbuf.type)) {
-        uint32_t nplanes = vbuf.length;
-        if (nplanes > VIDEO_MAX_PLANES)
-            nplanes = VIDEO_MAX_PLANES;
+    is_mplane = V4L2_TYPE_IS_MULTIPLANAR(vbuf.type);
+    if (is_mplane) {
+        nplanes = vbuf.length;
+        if (nplanes > VIDEO_MAX_PLANES) {
+            resp->hdr.status = EINVAL;
+            *resp_len = sizeof(*resp);
+            return;
+        }
 
         /* Planes array follows v4l2_buffer in the payload */
-        size_t planes_offset = sizeof(struct v4l2_buffer);
-        size_t planes_size = nplanes * sizeof(struct v4l2_plane);
+        planes_size = nplanes * sizeof(struct v4l2_plane);
 
-        if (payload_len >= planes_offset + planes_size) {
-            memcpy(planes, payload + planes_offset, planes_size);
+        if (payload_len >= sizeof(struct v4l2_buffer) + planes_size) {
+            memcpy(planes, payload + sizeof(struct v4l2_buffer), planes_size);
         }
 
         /* Fix up the planes pointer */
@@ -303,21 +548,86 @@ static void handle_buffer_ioctl(struct vhost_user_media *m,
     }
 
     /*
-     * For QBUF with MMAP memory, the buffer is already on the device.
-     * For DQBUF, we just need to dequeue.
+     * Select the memory model of this buffer's queue. MMAP means the host owns
+     * the buffers (the common case). DMABUF means the guest owns them and has
+     * sent grant references we must turn back into a local dma-buf fd.
      */
-    vbuf.memory = V4L2_MEMORY_MMAP;
+    qmem = V4L2_TYPE_IS_OUTPUT(vbuf.type) ? s->output_memory
+                                          : s->capture_memory;
+    vbuf.memory = qmem;
+
+    /*
+     * For a DMABUF QBUF/PREPARE_BUF, each plane's m.fd holds the resource_id
+     * the guest assigned at DMABUF_ATTACH time; resolve it to the local
+     * dma-buf fd we exported for that backing and store it in m.fd for the
+     * real ioctl. QUERYBUF/DQBUF carry no meaningful fd.
+     */
+    if (qmem == V4L2_MEMORY_DMABUF &&
+        (v4l2_ioctl_nr == VIDIOC_QBUF ||
+         v4l2_ioctl_nr == VIDIOC_PREPARE_BUF)) {
+        for (uint32_t p = 0; p < nplanes; p++) {
+            uint32_t resource_id = is_mplane ? (uint32_t)planes[p].m.fd
+                                             : (uint32_t)vbuf.m.fd;
+            int fd = dmabuf_resolve_resource(s, resource_id);
+
+            if (fd < 0) {
+                g_warning("DMABUF QBUF: unknown resource_id %u (plane %u)",
+                          resource_id, p);
+                resp->hdr.status = EINVAL;
+                *resp_len = sizeof(*resp);
+                return;
+            }
+
+            g_debug("DMABUF QBUF: type=%u plane=%u resource_id=%u -> fd=%d",
+                    vbuf.type, p, resource_id, fd);
+
+            /* Save the guest resource_id so we can restore it afterwards. */
+            if (is_mplane) {
+                orig_plane_fd[p] = planes[p].m.fd;
+                planes[p].m.fd = fd;
+            } else {
+                orig_fd = vbuf.m.fd;
+                vbuf.m.fd = fd;
+            }
+        }
+        did_substitute = true;
+    }
 
     ret = ioctl(s->v4l2_fd, v4l2_ioctl_nr, &vbuf);
+
+    /*
+     * Restore the guest's original m.fd values (only for the DMABUF planes we
+     * substituted above) so we never leak our local host fd back to the guest.
+     * Other memory models leave m untouched, so the mem_offset the QUERYBUF
+     * ioctl just filled in reaches the guest intact.
+     */
+    if (did_substitute) {
+        if (is_mplane) {
+            for (uint32_t p = 0; p < nplanes; p++)
+                planes[p].m.fd = orig_plane_fd[p];
+        } else {
+            vbuf.m.fd = orig_fd;
+        }
+    }
+
     if (ret < 0) {
-        resp->hdr.status = errno;
+        int saved_errno = errno;
+        if (v4l2_ioctl_nr == VIDIOC_QBUF ||
+            v4l2_ioctl_nr == VIDIOC_PREPARE_BUF)
+            g_warning("ioctl %s failed: %s (type=%u index=%u memory=%u "
+                      "length=%u bytesused=%u)",
+                      v4l2_ioctl_nr == VIDIOC_QBUF ? "VIDIOC_QBUF"
+                                                   : "VIDIOC_PREPARE_BUF",
+                      strerror(saved_errno), vbuf.type, vbuf.index,
+                      vbuf.memory, vbuf.length, vbuf.bytesused);
+        resp->hdr.status = saved_errno;
         /* Still write back the buffer for error reporting */
         memcpy(resp_payload, &vbuf, sizeof(vbuf));
-        if (V4L2_TYPE_IS_MULTIPLANAR(vbuf.type)) {
+        if (is_mplane) {
             memcpy(resp_payload + sizeof(vbuf), planes,
-                   vbuf.length * sizeof(struct v4l2_plane));
+                   nplanes * sizeof(struct v4l2_plane));
             *resp_len = sizeof(*resp) + sizeof(vbuf) +
-                        vbuf.length * sizeof(struct v4l2_plane);
+                        nplanes * sizeof(struct v4l2_plane);
         } else {
             *resp_len = sizeof(*resp) + sizeof(vbuf);
         }
@@ -343,10 +653,7 @@ static void handle_buffer_ioctl(struct vhost_user_media *m,
     struct v4l2_plane *saved_planes = vbuf.m.planes;
     memcpy(resp_payload, &vbuf, sizeof(vbuf));
 
-    if (V4L2_TYPE_IS_MULTIPLANAR(vbuf.type) && saved_planes) {
-        uint32_t nplanes = vbuf.length;
-        if (nplanes > VIDEO_MAX_PLANES)
-            nplanes = VIDEO_MAX_PLANES;
+    if (is_mplane && saved_planes) {
         memcpy(resp_payload + sizeof(vbuf), saved_planes,
                nplanes * sizeof(struct v4l2_plane));
         *resp_len = sizeof(*resp) + sizeof(vbuf) +
@@ -372,6 +679,7 @@ static void handle_reqbufs_ioctl(struct vhost_user_media *m,
         (struct virtio_media_resp_ioctl *)resp_buf;
     struct v4l2_requestbuffers reqbufs;
     uint8_t *resp_payload = resp_buf + sizeof(*resp);
+    bool want_dmabuf;
     int ret;
 
     if (payload_len < sizeof(reqbufs)) {
@@ -382,8 +690,16 @@ static void handle_reqbufs_ioctl(struct vhost_user_media *m,
 
     memcpy(&reqbufs, payload, sizeof(reqbufs));
 
-    /* Force MMAP memory type - host owns the buffers */
-    reqbufs.memory = V4L2_MEMORY_MMAP;
+    /*
+     * The guest picks the memory model. DMABUF means the guest owns the
+     * buffers and will send grant references with each QBUF (see
+     * handle_buffer_ioctl); MMAP (the default and anything else) means the
+     * host owns them and exports grant refs from EXPBUF (see handle_cmd_mmap).
+     * The guest only ever asks for DMABUF when its allow_dmabuf parameter is
+     * set, so honour whatever it requests and let the real device validate it.
+     */
+    want_dmabuf = (reqbufs.memory == V4L2_MEMORY_DMABUF);
+    reqbufs.memory = want_dmabuf ? V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP;
 
     ret = ioctl(s->v4l2_fd, VIDIOC_REQBUFS, &reqbufs);
     if (ret < 0) {
@@ -392,6 +708,12 @@ static void handle_reqbufs_ioctl(struct vhost_user_media *m,
         *resp_len = sizeof(*resp) + sizeof(reqbufs);
         return;
     }
+
+    /* Record this queue's memory model for the QBUF/DQBUF paths. */
+    if (V4L2_TYPE_IS_OUTPUT(reqbufs.type))
+        s->output_memory = reqbufs.memory;
+    else
+        s->capture_memory = reqbufs.memory;
 
     /*
      * REQBUFS (with any count) frees the queue's previous buffers on the host
@@ -422,9 +744,22 @@ static void handle_reqbufs_ioctl(struct vhost_user_media *m,
         }
     }
 
-    /* Strip DMABUF and USERPTR capabilities */
-    reqbufs.capabilities &= ~V4L2_BUF_CAP_SUPPORTS_DMABUF;
+    /*
+     * Note on DMABUF exports: unlike the mmap entries above, we do NOT release
+     * this queue's dma-buf exports here. In the resource_id model the guest
+     * drives their lifetime explicitly: it sends a DMABUF_DETACH for each
+     * backing once its own REQBUFS has freed the buffer set on this device
+     * (see handle_cmd_dmabuf_detach). Releasing them here would double-free and
+     * could end grants the guest still believes are attached.
+     */
+
+    /*
+     * Strip USERPTR (never supported). Keep DMABUF only when the queue was set
+     * up for it, so the guest keeps advertising it; otherwise strip it too.
+     */
     reqbufs.capabilities &= ~V4L2_BUF_CAP_SUPPORTS_USERPTR;
+    if (!want_dmabuf)
+        reqbufs.capabilities &= ~V4L2_BUF_CAP_SUPPORTS_DMABUF;
 
     resp->hdr.status = 0;
     memcpy(resp_payload, &reqbufs, sizeof(reqbufs));
@@ -1131,6 +1466,12 @@ void vhost_media_process_command(struct vhost_user_media *m,
     case VIRTIO_MEDIA_CMD_MUNMAP:
         handle_cmd_munmap(m, cmd_buf, cmd_len, resp_buf, resp_len);
         break;
+    case VIRTIO_MEDIA_CMD_DMABUF_ATTACH:
+        handle_cmd_dmabuf_attach(m, cmd_buf, cmd_len, resp_buf, resp_len);
+        break;
+    case VIRTIO_MEDIA_CMD_DMABUF_DETACH:
+        handle_cmd_dmabuf_detach(m, cmd_buf, cmd_len, resp_buf, resp_len);
+        break;
     default:
         g_warning("Unknown command %u", hdr->cmd);
         {
@@ -1238,7 +1579,7 @@ static enum drain_result drain_capture_queue(struct vhost_user_media *m,
         memset(&vbuf, 0, sizeof(vbuf));
         memset(planes, 0, sizeof(planes));
         vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        vbuf.memory = V4L2_MEMORY_MMAP;
+        vbuf.memory = s->capture_memory;
         vbuf.length = VIDEO_MAX_PLANES;
         vbuf.m.planes = planes;
 
@@ -1317,7 +1658,7 @@ void vhost_media_poll_session(struct vhost_user_media *m,
         memset(&vbuf, 0, sizeof(vbuf));
         memset(planes, 0, sizeof(planes));
         vbuf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        vbuf.memory = V4L2_MEMORY_MMAP;
+        vbuf.memory = s->output_memory;
         vbuf.length = VIDEO_MAX_PLANES;
         vbuf.m.planes = planes;
 
@@ -1328,7 +1669,7 @@ void vhost_media_poll_session(struct vhost_user_media *m,
             memset(&vbuf, 0, sizeof(vbuf));
             memset(planes, 0, sizeof(planes));
             vbuf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-            vbuf.memory = V4L2_MEMORY_MMAP;
+            vbuf.memory = s->output_memory;
             vbuf.length = VIDEO_MAX_PLANES;
             vbuf.m.planes = planes;
         }

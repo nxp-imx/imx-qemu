@@ -16,11 +16,13 @@
 /*
  * Command codes.
  */
-#define VIRTIO_MEDIA_CMD_OPEN   1
-#define VIRTIO_MEDIA_CMD_CLOSE  2
-#define VIRTIO_MEDIA_CMD_IOCTL  3
-#define VIRTIO_MEDIA_CMD_MMAP   4
-#define VIRTIO_MEDIA_CMD_MUNMAP 5
+#define VIRTIO_MEDIA_CMD_OPEN          1
+#define VIRTIO_MEDIA_CMD_CLOSE         2
+#define VIRTIO_MEDIA_CMD_IOCTL         3
+#define VIRTIO_MEDIA_CMD_MMAP          4
+#define VIRTIO_MEDIA_CMD_MUNMAP        5
+#define VIRTIO_MEDIA_CMD_DMABUF_ATTACH 6
+#define VIRTIO_MEDIA_CMD_DMABUF_DETACH 7
 
 /*
  * Event codes.
@@ -123,6 +125,49 @@ struct virtio_media_cmd_munmap {
 };
 
 struct virtio_media_resp_munmap {
+    struct virtio_media_resp_header hdr;
+};
+
+/*
+ * DMABUF_ATTACH command.
+ *
+ * For a V4L2_MEMORY_DMABUF queue the guest owns the buffers. Before a dma-buf
+ * plane is first queued (or after it is rebound to a different dma-buf), the
+ * guest grants the plane's pages to this (backend) domain and sends their
+ * grant references with this command together with a guest-assigned
+ * resource_id. The header is followed, in the device-readable part of the
+ * chain, by a uint32_t refs[num_refs] array. The backend turns the grant
+ * references back into a local dma-buf (xengnttab_dmabuf_exp_from_refs()) and
+ * remembers it under resource_id; subsequent QBUF/PREPARE_BUF of the same
+ * plane only carry resource_id (in v4l2_buffer m.fd / plane m.fd).
+ */
+struct virtio_media_cmd_dmabuf_attach {
+    struct virtio_media_cmd_header hdr;
+    uint32_t session_id;
+    uint32_t resource_id;
+    uint32_t num_refs;
+    uint32_t __reserved;
+};
+
+struct virtio_media_resp_dmabuf_attach {
+    struct virtio_media_resp_header hdr;
+};
+
+/*
+ * DMABUF_DETACH command.
+ *
+ * Releases the local dma-buf the backend exported for resource_id, letting the
+ * guest end the foreign grants. Sent on rebind, on a failed QBUF that would
+ * have used the backing, or when the queue's buffers are freed (REQBUFS /
+ * session close).
+ */
+struct virtio_media_cmd_dmabuf_detach {
+    struct virtio_media_cmd_header hdr;
+    uint32_t session_id;
+    uint32_t resource_id;
+};
+
+struct virtio_media_resp_dmabuf_detach {
     struct virtio_media_resp_header hdr;
 };
 
