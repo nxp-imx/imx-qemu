@@ -1499,7 +1499,7 @@ vu_lookup_shared_object(VuDev *dev, unsigned char uuid[UUID_LEN],
                         int *dmabuf_fd)
 {
     bool result = false;
-    VhostUserMsg msg_reply;
+    VhostUserMsg msg_reply = { 0, };
     VhostUserMsg msg = {
         .request = VHOST_USER_BACKEND_SHARED_OBJECT_LOOKUP,
         .size = sizeof(msg.payload.object),
@@ -1533,9 +1533,29 @@ vu_lookup_shared_object(VuDev *dev, unsigned char uuid[UUID_LEN],
         goto out;
     }
 
+    if (msg_reply.payload.u64 != 0 || msg_reply.fds[0] < 0) {
+        goto out;
+    }
+
     *dmabuf_fd = msg_reply.fds[0];
-    result = *dmabuf_fd > 0 && msg_reply.payload.u64 == 0;
+    result = true;
 out:
+    /*
+     * Any fds attached to a reply we are not going to use (protocol errors,
+     * a non-success status, or an unexpected fd count) were received over
+     * SCM_RIGHTS and would otherwise leak. Close them, except the one fd we
+     * are handing back to the caller on success.
+     */
+    if (!result) {
+        int i;
+
+        for (i = 0; i < msg_reply.fd_num; i++) {
+            if (msg_reply.fds[i] >= 0) {
+                close(msg_reply.fds[i]);
+            }
+        }
+    }
+
     pthread_mutex_unlock(&dev->backend_mutex);
 
     return result;

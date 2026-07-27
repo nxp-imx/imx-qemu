@@ -1710,7 +1710,8 @@ vhost_user_backend_handle_shared_object_remove(struct vhost_dev *dev,
 }
 
 static bool vhost_user_send_resp(QIOChannel *ioc, VhostUserHeader *hdr,
-                                 VhostUserPayload *payload, Error **errp)
+                                 VhostUserPayload *payload,
+                                 int *fds, size_t nfds, Error **errp)
 {
     struct iovec iov[] = {
         { .iov_base = hdr,      .iov_len = VHOST_USER_HDR_SIZE },
@@ -1720,6 +1721,10 @@ static bool vhost_user_send_resp(QIOChannel *ioc, VhostUserHeader *hdr,
     hdr->flags &= ~VHOST_USER_NEED_REPLY_MASK;
     hdr->flags |= VHOST_USER_REPLY_MASK;
 
+    if (nfds) {
+        return !qio_channel_writev_full_all(ioc, iov, ARRAY_SIZE(iov),
+                                            fds, nfds, 0, errp);
+    }
     return !qio_channel_writev_all(ioc, iov, ARRAY_SIZE(iov), errp);
 }
 
@@ -1732,6 +1737,7 @@ int vhost_user_get_shared_object(struct vhost_dev *dev, unsigned char *uuid,
     VhostUserMsg msg = {
         .hdr.request = VHOST_USER_GET_SHARED_OBJECT,
         .hdr.flags = VHOST_USER_VERSION,
+        .hdr.size = sizeof(msg.payload.object),
     };
     memcpy(msg.payload.object.uuid, uuid, sizeof(msg.payload.object.uuid));
 
@@ -1763,17 +1769,19 @@ int vhost_user_get_shared_object(struct vhost_dev *dev, unsigned char *uuid,
 
 static int
 vhost_user_backend_handle_shared_object_lookup(struct vhost_user *u,
-                                               VhostUserShared *object)
+                                               VhostUserShared *object,
+                                               int *dmabuf_fd_out,
+                                               bool *dmabuf_fd_owned_out)
 {
     QemuUUID uuid;
-    CharFrontend *chr = u->user->chr;
     int dmabuf_fd = -1;
-    int fd_num = 0;
+    bool owned = false;
 
     memcpy(uuid.data, object->uuid, sizeof(object->uuid));
 
     switch (virtio_object_type(&uuid)) {
     case TYPE_DMABUF:
+        /* Borrowed: the fd is owned by the dmabuf hash table, do not close. */
         dmabuf_fd = virtio_lookup_dmabuf(&uuid);
         break;
     case TYPE_VHOST_DEV:
@@ -1786,21 +1794,20 @@ vhost_user_backend_handle_shared_object_lookup(struct vhost_user *u,
         if (ret < 0) {
             return ret;
         }
+        /*
+         * Owned: qemu_chr_fe_get_msgfd() handed us a freshly received
+         * SCM_RIGHTS fd. Once relayed to the requesting backend it must be
+         * closed here, otherwise every cross-process lookup miss leaks an fd.
+         */
+        owned = true;
         break;
     }
     case TYPE_INVALID:
         return -EINVAL;
     }
 
-    if (dmabuf_fd != -1) {
-        fd_num++;
-    }
-
-    if (qemu_chr_fe_set_msgfds(chr, &dmabuf_fd, fd_num) < 0) {
-        error_report("Failed to set msg fds.");
-        return -EINVAL;
-    }
-
+    *dmabuf_fd_out = dmabuf_fd;
+    *dmabuf_fd_owned_out = owned;
     return 0;
 }
 
@@ -1827,6 +1834,9 @@ static gboolean backend_read(QIOChannel *ioc, GIOCondition condition,
     g_autofree int *fd = NULL;
     size_t fdsize = 0;
     bool reply_ack;
+    bool is_lookup = false;
+    int lookup_fd = -1;
+    bool lookup_fd_owned = false;
     int i;
 
     /* Read header */
@@ -1874,12 +1884,49 @@ static gboolean backend_read(QIOChannel *ioc, GIOCondition condition,
     case VHOST_USER_BACKEND_SHARED_OBJECT_LOOKUP:
         /* The backend always expects a response */
         reply_ack = true;
+        is_lookup = true;
         ret = vhost_user_backend_handle_shared_object_lookup(dev->opaque,
-                                                             &payload.object);
+                                                             &payload.object,
+                                                             &lookup_fd,
+                                                             &lookup_fd_owned);
         break;
     default:
         error_report("Received unexpected msg type: %d.", hdr.request);
         ret = -EINVAL;
+    }
+
+    /*
+     * SHARED_OBJECT_LOOKUP must return the dma-buf fd (if any) to the
+     * requesting backend over this same backend channel via SCM_RIGHTS,
+     * alongside a u64 status payload (0 == success). This is distinct from
+     * the generic REPLY_ACK path below, which carries no fd.
+     */
+    if (is_lookup) {
+        int nfds = (ret == 0 && lookup_fd >= 0) ? 1 : 0;
+        payload.u64 = (nfds == 1) ? 0 : 1;
+        hdr.size = sizeof(payload.u64);
+        if (!vhost_user_send_resp(ioc, &hdr, &payload,
+                                  nfds ? &lookup_fd : NULL, nfds, &local_err)) {
+            error_report_err(local_err);
+            /*
+             * Still release an owned fd before tearing down: the SCM_RIGHTS
+             * send does not consume it, so err path must close it too.
+             */
+            if (lookup_fd_owned && lookup_fd >= 0) {
+                close(lookup_fd);
+            }
+            goto err;
+        }
+        /*
+         * qio_channel_writev_full_all() does not close the fds it sends; the
+         * fd fetched from a producer backend (TYPE_VHOST_DEV) is owned by us
+         * and must be closed now that it has been relayed. Borrowed fds
+         * (TYPE_DMABUF, owned by the dmabuf hash table) must be left alone.
+         */
+        if (lookup_fd_owned && lookup_fd >= 0) {
+            close(lookup_fd);
+        }
+        goto fdcleanup;
     }
 
     /*
@@ -1890,7 +1937,7 @@ static gboolean backend_read(QIOChannel *ioc, GIOCondition condition,
         payload.u64 = !!ret;
         hdr.size = sizeof(payload.u64);
 
-        if (!vhost_user_send_resp(ioc, &hdr, &payload, &local_err)) {
+        if (!vhost_user_send_resp(ioc, &hdr, &payload, NULL, 0, &local_err)) {
             error_report_err(local_err);
             goto err;
         }
