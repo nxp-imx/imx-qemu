@@ -29,6 +29,15 @@ struct media_mmap_entry {
     uint32_t grant_ref_count;  /* Number of grant refs */
     uint32_t *refs;            /* Full grant ref array (grant_ref_count entries) */
     /*
+     * Shared-object UUID this host dma-buf is registered under (host-object
+     * model: host pages + UUID). Generated and registered with QEMU (vu_add_shared_object)
+     * when the buffer is exported in handle_cmd_mmap(); unregistered
+     * (vu_rm_shared_object) when this entry is freed, so its lifetime matches
+     * the exported dma_fd. A consumer device on the same QEMU resolves this
+     * UUID back to dma_fd via GET_SHARED_OBJECT -> get_shared_object.
+     */
+    uint8_t uuid[16];
+    /*
      * Superseded by a REQBUFS reallocation: the host buffer this maps was
      * freed/detached from the queue, so this entry must not be reused for a
      * new MMAP of the same v4l2_offset. Its grant refs are still held (the
@@ -58,6 +67,27 @@ struct media_dmabuf_export {
 };
 
 /*
+ * A consumer-side cache entry mapping a shared-object UUID to the local
+ * dma-buf fd we obtained for it (host-object consumer path). When the guest
+ * QBUFs a buffer backed by a host dma-buf shared under a UUID, we resolve the
+ * UUID to a local fd once (vu_lookup_shared_object, a synchronous cross-process
+ * RPC that receives the fd over SCM_RIGHTS) and cache it here; every later QBUF
+ * of the same UUID reuses the cached fd without another lookup. The fds are
+ * closed and the cache cleared on STREAMOFF of the owning queue (and on session
+ * close).
+ *
+ * Keyed by the full UUID (not a buffer index): when the producer reallocates
+ * its buffers (source change) it hands out fresh UUIDs, so a QBUF carrying a
+ * new UUID simply misses and re-looks-up; the stale entry lingers harmlessly
+ * until the next STREAMOFF.
+ */
+struct media_uuid_fd {
+    uint8_t uuid[16];            /* shared-object UUID - key */
+    int host_fd;                 /* local dma-buf fd from vu_lookup_shared_object */
+    enum v4l2_buf_type buf_type; /* queue this UUID was QBUF-ed on */
+};
+
+/*
  * A session represents one open() on the V4L2 device.
  */
 struct media_session {
@@ -80,6 +110,15 @@ struct media_session {
     enum v4l2_memory capture_memory; /* CAPTURE (frame) queue memory */
 
     GList *dmabuf_exports;   /* List of media_dmabuf_export, keyed by id */
+
+    /*
+     * Consumer-side UUID -> host dma-buf fd cache (host-object model).
+     * Populated lazily on the first QBUF of each UUID (vu_lookup_shared_object)
+     * and reused for subsequent frames; entries of a queue are closed and
+     * dropped on that queue's STREAMOFF, and all on session close. See struct
+     * media_uuid_fd.
+     */
+    GList *uuid_fds;         /* List of media_uuid_fd, keyed by UUID */
 };
 
 /*
@@ -174,5 +213,15 @@ void vhost_media_poll_session(struct vhost_user_media *m,
  * Ioctl code lookup.
  */
 unsigned long virtio_media_code_to_ioctl(uint32_t code);
+
+/*
+ * Resolve a shared-object UUID to the local dma-buf fd of the host buffer
+ * exported under it (host-object model). Returns the fd (>= 0) owned by the
+ * matching media_mmap_entry, or -1 if no live entry carries this UUID. The
+ * caller must not close the returned fd; libvhost-user duplicates it over
+ * SCM_RIGHTS to the requesting consumer daemon.
+ */
+int vhost_media_lookup_shared_object(struct vhost_user_media *m,
+                                     const uint8_t uuid[16]);
 
 #endif /* VHOST_USER_MEDIA_H */

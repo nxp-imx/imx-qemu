@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -30,6 +31,7 @@
 
 #include <xengnttab.h>
 
+#include "libvhost-user.h"
 #include "vhost-user-media.h"
 
 /* Number of event buffers pre-allocated on the event queue */
@@ -50,6 +52,8 @@ static void queue_grant_release(struct vhost_user_media *m, int dma_fd,
 static void release_dmabuf_export(struct vhost_user_media *m,
                                   struct media_dmabuf_export *exp);
 
+static void uuid_fd_cache_clear(struct media_session *s, int keep_type);
+
 static struct media_session *find_session(struct vhost_user_media *m,
                                           uint32_t session_id)
 {
@@ -61,6 +65,70 @@ static struct media_session *find_session(struct vhost_user_media *m,
             return s;
     }
     return NULL;
+}
+
+/*
+ * Generate a fresh 128-bit shared-object UUID for a host dma-buf (host-object
+ * model). QEMU treats the UUID as an opaque key, so any collision-free value
+ * works; we use getrandom() and set the RFC 4122 version 4 / variant bits so
+ * the value is a well-formed random UUID. Falls back to a monotonic counter
+ * mixed into the buffer if getrandom() ever fails, which still yields distinct
+ * keys.
+ */
+static void media_generate_uuid(uint8_t uuid[16])
+{
+    if (getrandom(uuid, 16, 0) != 16) {
+        static uint64_t seq;
+        uint64_t n = __atomic_add_fetch(&seq, 1, __ATOMIC_RELAXED);
+
+        memset(uuid, 0, 16);
+        memcpy(uuid, &n, sizeof(n));
+    }
+    uuid[6] = (uuid[6] & 0x0f) | 0x40; /* version 4 */
+    uuid[8] = (uuid[8] & 0x3f) | 0x80; /* variant 1 */
+}
+
+/*
+ * Resolve a shared-object UUID to the local dma-buf fd exported under it.
+ * Scans every session's MMAP entries (including stale ones, whose dma_fd is
+ * still open until the matching MUNMAP). Returns dma_fd (>= 0) or -1.
+ *
+ * A linear scan is fine: this runs only on a consumer cache miss (first frame
+ * per buffer / after a source change), never per queued frame.
+ */
+int vhost_media_lookup_shared_object(struct vhost_user_media *m,
+                                     const uint8_t uuid[16])
+{
+    for (GList *sl = m->sessions; sl != NULL; sl = sl->next) {
+        struct media_session *s = sl->data;
+
+        for (GList *l = s->mmaps; l != NULL; l = l->next) {
+            struct media_mmap_entry *entry = l->data;
+
+            if (memcmp(entry->uuid, uuid, 16) == 0)
+                return entry->dma_fd;
+        }
+    }
+    return -1;
+}
+
+/*
+ * Undo the vu_add_shared_object() done for a host dma-buf when its entry is
+ * freed. No-op if the entry carries an all-zero UUID (registration never
+ * succeeded). The UUID is cleared afterwards so a double free cannot re-issue
+ * the removal.
+ */
+static void vhost_media_unregister_shared_object(struct vhost_user_media *m,
+                                                 struct media_mmap_entry *entry)
+{
+    static const uint8_t zero_uuid[16] = {0};
+
+    if (memcmp(entry->uuid, zero_uuid, 16) == 0)
+        return;
+
+    if (m->opaque)
+        vu_rm_shared_object((VuDev *)m->opaque, entry->uuid);
+    memset(entry->uuid, 0, sizeof(entry->uuid));
 }
 
 /*
@@ -141,6 +209,7 @@ void vhost_media_destroy_session(struct vhost_user_media *m,
     /* Release all MMAP buffer grant refs for this session (off main loop) */
     for (GList *l = s->mmaps; l != NULL; l = l->next) {
         struct media_mmap_entry *entry = l->data;
+        vhost_media_unregister_shared_object(m, entry);
         queue_grant_release(m, entry->dma_fd, entry->refs);
         g_free(entry);
     }
@@ -161,6 +230,9 @@ void vhost_media_destroy_session(struct vhost_user_media *m,
         g_free(exp);
     }
     g_list_free(s->dmabuf_exports);
+
+    /* Close and drop the entire host-object consumer UUID->fd cache. */
+    uuid_fd_cache_clear(s, -1);
 
     m->sessions = g_list_remove(m->sessions, s);
     g_free(s);
@@ -435,6 +507,88 @@ static int dmabuf_resolve_resource(struct media_session *s,
 }
 
 /*
+ * Resolve a per-frame shared-object UUID (host-object consumer path) to a local
+ * dma-buf fd for the real V4L2 device. Uses the session's UUID->fd cache: on a
+ * hit the cached fd is returned; on a miss vu_lookup_shared_object() performs a
+ * synchronous cross-process RPC (backend channel -> QEMU -> producer daemon ->
+ * SCM_RIGHTS fd), and the resulting fd is cached under the UUID and the queue
+ * it was QBUF-ed on. Returns the fd (>= 0) or -1 if the object cannot be found
+ * (an invalid/unknown UUID makes the QBUF fail, as with an unknown resource_id).
+ *
+ * The cache owns the fd; it is closed on the queue's STREAMOFF (see
+ * uuid_fd_cache_clear()) or session close. The caller must NOT close it.
+ *
+ * CONSTRAINT: the miss path is a nested synchronous RPC that blocks this
+ * daemon's main loop until the producer replies (consumer backend channel ->
+ * QEMU -> producer main channel -> producer). It therefore assumes the
+ * producer and consumer of a given host dma-buf are DIFFERENT daemon
+ * processes. A single daemon that both exported a UUID and consumes it would
+ * deadlock: it would block here waiting for a reply it must itself service on
+ * the same (now blocked) main loop. The current split (a dedicated encoder
+ * daemon and decoder daemon) satisfies this; do not collapse a producer and
+ * its consumer into one process.
+ */
+static int uuid_resolve_host_fd(struct vhost_user_media *m,
+                                struct media_session *s,
+                                const uint8_t uuid[16],
+                                enum v4l2_buf_type buf_type)
+{
+    struct media_uuid_fd *uf;
+    int host_fd = -1;
+
+    for (GList *l = s->uuid_fds; l != NULL; l = l->next) {
+        uf = l->data;
+        if (memcmp(uf->uuid, uuid, 16) == 0)
+            return uf->host_fd;
+    }
+
+    if (!m->opaque ||
+        !vu_lookup_shared_object((VuDev *)m->opaque, (unsigned char *)uuid,
+                                 &host_fd) ||
+        host_fd < 0) {
+        return -1;
+    }
+
+    uf = g_new0(struct media_uuid_fd, 1);
+    memcpy(uf->uuid, uuid, 16);
+    uf->host_fd = host_fd;
+    uf->buf_type = buf_type;
+    s->uuid_fds = g_list_append(s->uuid_fds, uf);
+
+    return host_fd;
+}
+
+/*
+ * Drop the consumer UUID->fd cache. If keep_type is negative, clear every
+ * entry (session close). Otherwise clear only the entries QBUF-ed on the given
+ * queue (that queue's STREAMOFF). Each dropped entry's host_fd is closed,
+ * releasing this consumer's reference on the producer's host dma-buf.
+ *
+ * A cache entry records the buf_type of the queue it was first QBUF-ed on. If
+ * the same host dma-buf were shared by two queues of different types in one
+ * session, one queue's STREAMOFF would not drop it; it would linger until
+ * session close. That is a delayed release, not a leak, and does not happen
+ * with the current one-UUID-per-queue usage.
+ */
+static void uuid_fd_cache_clear(struct media_session *s, int keep_type)
+{
+    GList *l = s->uuid_fds;
+
+    while (l != NULL) {
+        struct media_uuid_fd *uf = l->data;
+        GList *next = l->next;
+
+        if (keep_type < 0 || uf->buf_type == (enum v4l2_buf_type)keep_type) {
+            if (uf->host_fd >= 0)
+                close(uf->host_fd);
+            s->uuid_fds = g_list_delete_link(s->uuid_fds, l);
+            g_free(uf);
+        }
+        l = next;
+    }
+}
+
+/*
  * Command handlers
  */
 
@@ -561,27 +715,75 @@ static void handle_buffer_ioctl(struct vhost_user_media *m,
      * the guest assigned at DMABUF_ATTACH time; resolve it to the local
      * dma-buf fd we exported for that backing and store it in m.fd for the
      * real ioctl. QUERYBUF/DQBUF carry no meaningful fd.
+     *
+     * Host-object buffers (UUID-backed host dma-bufs) are distinguished from
+     * guest-pages buffers (grant-imported resource ids) by a per-plane UUID
+     * footer the guest appends after the v4l2_buffer (and planes array).
+     * main.c linearises all device-readable descriptors into one payload, so
+     * the footers are just trailing bytes: it is host-object when the payload
+     * is exactly the v4l2_buffer + planes + nplanes UUID footers and every
+     * footer's flag is set. An exact length match (rather than >=) avoids
+     * mistaking a guest-pages QBUF that happens to carry trailing bytes for a
+     * UUID footer.
      */
     if (qmem == V4L2_MEMORY_DMABUF &&
         (v4l2_ioctl_nr == VIDIOC_QBUF ||
          v4l2_ioctl_nr == VIDIOC_PREPARE_BUF)) {
-        for (uint32_t p = 0; p < nplanes; p++) {
-            uint32_t resource_id = is_mplane ? (uint32_t)planes[p].m.fd
-                                             : (uint32_t)vbuf.m.fd;
-            int fd = dmabuf_resolve_resource(s, resource_id);
+        size_t footers_off = sizeof(struct v4l2_buffer) + planes_size;
+        size_t footers_size = (size_t)nplanes *
+                              sizeof(struct virtio_media_dmabuf_uuid);
+        const struct virtio_media_dmabuf_uuid *footers =
+            (const struct virtio_media_dmabuf_uuid *)(payload + footers_off);
+        bool is_uuid = payload_len == footers_off + footers_size;
 
-            if (fd < 0) {
-                g_warning("DMABUF QBUF: unknown resource_id %u (plane %u)",
-                          resource_id, p);
-                resp->hdr.status = EINVAL;
-                *resp_len = sizeof(*resp);
-                return;
+        /*
+         * All planes must agree: either every plane carries a UUID footer
+         * (host-object) or none does (guest-pages). A partial set is a
+         * malformed request, not a hint to read undefined footer bytes.
+         */
+        if (is_uuid) {
+            for (uint32_t p = 0; p < nplanes; p++) {
+                if (!(footers[p].flags & VIRTIO_MEDIA_DMABUF_F_UUID)) {
+                    g_warning("DMABUF QBUF: plane %u missing UUID footer flag",
+                              p);
+                    resp->hdr.status = EINVAL;
+                    *resp_len = sizeof(*resp);
+                    return;
+                }
+            }
+        }
+
+        for (uint32_t p = 0; p < nplanes; p++) {
+            int fd;
+
+            if (is_uuid) {
+                fd = uuid_resolve_host_fd(m, s, footers[p].uuid, vbuf.type);
+                if (fd < 0) {
+                    g_warning("DMABUF QBUF: UUID lookup failed (plane %u)", p);
+                    resp->hdr.status = EINVAL;
+                    *resp_len = sizeof(*resp);
+                    return;
+                }
+                g_debug("DMABUF QBUF: type=%u plane=%u UUID -> fd=%d",
+                        vbuf.type, p, fd);
+            } else {
+                uint32_t resource_id = is_mplane ? (uint32_t)planes[p].m.fd
+                                                 : (uint32_t)vbuf.m.fd;
+                fd = dmabuf_resolve_resource(s, resource_id);
+
+                if (fd < 0) {
+                    g_warning("DMABUF QBUF: unknown resource_id %u (plane %u)",
+                              resource_id, p);
+                    resp->hdr.status = EINVAL;
+                    *resp_len = sizeof(*resp);
+                    return;
+                }
+
+                g_debug("DMABUF QBUF: type=%u plane=%u resource_id=%u -> fd=%d",
+                        vbuf.type, p, resource_id, fd);
             }
 
-            g_debug("DMABUF QBUF: type=%u plane=%u resource_id=%u -> fd=%d",
-                    vbuf.type, p, resource_id, fd);
-
-            /* Save the guest resource_id so we can restore it afterwards. */
+            /* Save the guest m.fd so we can restore it afterwards. */
             if (is_mplane) {
                 orig_plane_fd[p] = planes[p].m.fd;
                 planes[p].m.fd = fd;
@@ -1070,6 +1272,14 @@ static void handle_cmd_ioctl(struct vhost_user_media *m,
         if (V4L2_TYPE_IS_OUTPUT(btype)) {
             s->output_streaming = false;
         }
+        /*
+         * Drop this queue's host-object consumer UUID->fd cache: the client is
+         * about to reconfigure (e.g. a source change reallocates the
+         * producer's buffers under fresh UUIDs), so the cached host fds must
+         * not be reused. Closing them releases this consumer's reference on
+         * the producer's host dma-bufs.
+         */
+        uuid_fd_cache_clear(s, (int)btype);
     }
 
     if (dir & _IOC_READ) {
@@ -1131,6 +1341,7 @@ static void handle_cmd_mmap(struct vhost_user_media *m,
             resp->grant_ref_header = entry->grant_ref_header;
             resp->grant_ref_count = entry->grant_ref_count;
             resp->len = entry->len;
+            memcpy(resp->uuid, entry->uuid, sizeof(resp->uuid));
             memcpy((uint8_t *)resp_buf + sizeof(*resp), entry->refs,
                    (size_t)entry->grant_ref_count * sizeof(uint32_t));
             *resp_len = sizeof(*resp) +
@@ -1278,6 +1489,26 @@ static void handle_cmd_mmap(struct vhost_user_media *m,
 
     s->mmaps = g_list_append(s->mmaps, entry);
 
+    /*
+     * Host-object model (host pages + UUID): register this host dma-buf with
+     * QEMU can resolve it back to dma_fd cross-process (GET_SHARED_OBJECT ->
+     * get_shared_object). The UUID lives on the entry and is removed when the
+     * entry is freed (MUNMAP / session close), matching dma_fd's lifetime.
+     *
+     * Best-effort: if SHARED_OBJECT was not negotiated (m->opaque unset or
+     * vu_add_shared_object fails) the buffer still works for the normal
+     * grant/MMAP data path; only the cross-process UUID handoff is
+     * unavailable, so report an all-zero UUID to the guest.
+     */
+    media_generate_uuid(entry->uuid);
+    if (!m->opaque ||
+        !vu_add_shared_object((VuDev *)m->opaque, entry->uuid)) {
+        g_warning("MMAP: vu_add_shared_object failed for offset=0x%x "
+                  "(SHARED_OBJECT not negotiated?); UUID handoff disabled "
+                  "for this buffer", offset);
+        memset(entry->uuid, 0, sizeof(entry->uuid));
+    }
+
     g_debug("MMAP: offset=0x%x -> grant_ref=%u count=%u len=%u (buf %u plane %u)",
             offset, refs[0], page_count, buf_length,
             found_index, found_plane);
@@ -1294,6 +1525,7 @@ static void handle_cmd_mmap(struct vhost_user_media *m,
     resp->grant_ref_header = entry->grant_ref_header;
     resp->grant_ref_count = entry->grant_ref_count;
     resp->len = buf_length;
+    memcpy(resp->uuid, entry->uuid, sizeof(resp->uuid));
     memcpy((uint8_t *)resp_buf + sizeof(*resp), entry->refs,
            (size_t)page_count * sizeof(uint32_t));
     *resp_len = sizeof(*resp) + (size_t)page_count * sizeof(uint32_t);
@@ -1331,6 +1563,7 @@ static void handle_cmd_munmap(struct vhost_user_media *m,
                 entry->grant_ref_count == grant_ref_count) {
                 /* Release the imported dma-buf grant refs off the main loop */
                 s->mmaps = g_list_remove(s->mmaps, entry);
+                vhost_media_unregister_shared_object(m, entry);
                 queue_grant_release(m, entry->dma_fd, entry->refs);
                 g_free(entry);
                 resp->hdr.status = 0;

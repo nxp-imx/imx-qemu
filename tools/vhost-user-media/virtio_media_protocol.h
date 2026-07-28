@@ -4,7 +4,7 @@
  * Ported from the kernel driver (drivers/media/virtio/protocol.h).
  *
  * Copyright (c) 2024-2025 Google LLC.
- * Copyright 2025 NXP
+ * Copyright 2025-2026 NXP
  */
 
 #ifndef VIRTIO_MEDIA_PROTOCOL_H
@@ -113,6 +113,15 @@ struct virtio_media_resp_mmap {
     uint32_t grant_ref_header; /* First grant ref */
     uint32_t grant_ref_count;  /* Number of grant refs (pages) */
     uint64_t len;              /* Buffer length in bytes */
+    /*
+     * Shared-object UUID for this host dma-buf (host-object model: host pages
+     * + UUID). The backend registers each exported host buffer with QEMU under
+     * this UUID (vu_add_shared_object); the guest wraps the buffer in a
+     * virtio-dma-buf whose get_uuid() returns it, so a consumer device on the
+     * same QEMU can look the buffer up cross-process. All-zero when the
+     * backend did not register one.
+     */
+    uint8_t uuid[16];
 };
 
 /*
@@ -169,6 +178,27 @@ struct virtio_media_cmd_dmabuf_detach {
 
 struct virtio_media_resp_dmabuf_detach {
     struct virtio_media_resp_header hdr;
+};
+
+/*
+ * Per-frame shared-object UUID footer (host-object consumer path).
+ *
+ * For a V4L2_MEMORY_DMABUF buffer whose planes are backed by a host dma-buf
+ * shared under a UUID, the guest appends one such footer per plane to the
+ * device-readable part of a QBUF/PREPARE_BUF command, right after the
+ * v4l2_buffer (and its planes array, if multiplanar). Each plane may be backed
+ * by a distinct host dma-buf, so each carries its own UUID, mirroring the
+ * guest-pages model's per-plane m.fd resource ids. The backend resolves each
+ * UUID to its local dma-buf fd (vu_lookup_shared_object) instead of treating
+ * the plane's m.fd as a grant-imported resource id. Absent for grant-imported
+ * (guest-pages) dma-buf buffers, which carry resource ids in m.fd instead.
+ */
+#define VIRTIO_MEDIA_DMABUF_F_UUID (1 << 0)
+
+struct virtio_media_dmabuf_uuid {
+    uint8_t uuid[16];
+    uint32_t flags;
+    uint32_t __reserved;
 };
 
 /*

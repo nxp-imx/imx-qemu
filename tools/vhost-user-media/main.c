@@ -182,6 +182,11 @@ static void vu_media_handle_commandq(VuDev *vudev, int qidx)
          */
         if (vudev->xen_domainid)
             vu_media.media.domu_domid = vudev->xen_domainid;
+        /*
+         * Let the command layer reach the VuDev for the shared-object APIs
+         * (vu_add/rm_shared_object in handle_cmd_mmap / cleanup paths).
+         */
+        vu_media.media.opaque = vudev;
         vhost_media_process_command(&vu_media.media, cmd_buf, cmd_len,
                                     resp_buf, resp_buf_size, &resp_len);
 
@@ -283,12 +288,43 @@ static void vu_media_panic(VuDev *vudev, const char *msg)
         g_main_loop_quit(vu_media.loop);
 }
 
+/*
+ * Advertise VHOST_USER_PROTOCOL_F_SHARED_OBJECT on top of the libvhost-user
+ * defaults. Required so QEMU forwards BACKEND_SHARED_OBJECT_ADD/REMOVE/LOOKUP
+ * and GET_SHARED_OBJECT to/from this daemon (host-object model: host pages +
+ * UUID). F_BACKEND_REQ, which carries these backend-channel messages, is
+ * already in the libvhost-user default set.
+ */
+static uint64_t vu_media_get_protocol_features(VuDev *vudev)
+{
+    return 1ULL << VHOST_USER_PROTOCOL_F_SHARED_OBJECT;
+}
+
+/*
+ * Producer side of the host-object handoff: QEMU asks us (via
+ * GET_SHARED_OBJECT) for the fd behind a UUID we registered with
+ * vu_add_shared_object when the host buffer was exported. Return the owning
+ * entry's dma_fd; libvhost-user duplicates it over SCM_RIGHTS to the
+ * requesting consumer daemon, so we must NOT close it here (its lifetime is
+ * the MMAP entry's). Returns -1 if no live buffer carries this UUID.
+ */
+static int vu_media_get_shared_object(VuDev *vudev, const unsigned char *uuid)
+{
+    int fd = vhost_media_lookup_shared_object(&vu_media.media, uuid);
+
+    if (fd < 0)
+        g_warning("get_shared_object: no live buffer for requested UUID");
+    return fd;
+}
+
 static const VuDevIface vuiface = {
     .get_features = vu_media_get_features,
     .set_features = vu_media_set_features,
     .queue_set_started = vu_media_queue_set_started,
     .get_config = vu_media_get_config,
     .set_config = vu_media_set_config,
+    .get_protocol_features = vu_media_get_protocol_features,
+    .get_shared_object = vu_media_get_shared_object,
 };
 
 /*
