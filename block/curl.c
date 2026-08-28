@@ -865,6 +865,7 @@ out_noclean:
     g_free(s->cookie);
     g_free(s->url);
     g_free(s->username);
+    g_free(s->password);
     g_free(s->proxyusername);
     g_free(s->proxypassword);
     if (s->sockets) {
@@ -976,6 +977,7 @@ static void curl_close(BlockDriverState *bs)
     g_free(s->cookie);
     g_free(s->url);
     g_free(s->username);
+    g_free(s->password);
     g_free(s->proxyusername);
     g_free(s->proxypassword);
 }

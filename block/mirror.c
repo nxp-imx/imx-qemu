@@ -454,7 +454,7 @@ static void coroutine_fn mirror_co_discard(void *opaque)
     *op->bytes_handled = op->bytes;
     op->is_in_flight = true;
 
-    ret = blk_co_pdiscard(op->s->target, op->offset, op->bytes);
+    ret = blk_co_pdiscard(op->s->target, op->offset, op->bytes, 0);
     mirror_write_complete(op, ret);
 }
 
@@ -1276,22 +1276,24 @@ static void mirror_complete(Job *job, Error **errp)
         return;
     }
 
-    /* block all operations on to_replace bs */
-    if (s->replaces) {
-        s->to_replace = bdrv_find_node(s->replaces);
-        if (!s->to_replace) {
-            error_setg(errp, "Node name '%s' not found", s->replaces);
-            return;
+    if (!s->should_complete) {
+        /* block all operations on to_replace bs */
+        if (s->replaces) {
+            s->to_replace = bdrv_find_node(s->replaces);
+            if (!s->to_replace) {
+                error_setg(errp, "Node name '%s' not found", s->replaces);
+                return;
+            }
+
+            /* TODO Translate this into child freeze system. */
+            error_setg(&s->replace_blocker,
+                       "block device is in use by block-job-complete");
+            bdrv_op_block_all(s->to_replace, s->replace_blocker);
+            bdrv_ref(s->to_replace);
         }
 
-        /* TODO Translate this into child freeze system. */
-        error_setg(&s->replace_blocker,
-                   "block device is in use by block-job-complete");
-        bdrv_op_block_all(s->to_replace, s->replace_blocker);
-        bdrv_ref(s->to_replace);
+        s->should_complete = true;
     }
-
-    s->should_complete = true;
 
     /* If the job is paused, it will be re-entered when it is resumed */
     WITH_JOB_LOCK_GUARD() {
@@ -1530,7 +1532,7 @@ do_sync_target_write(MirrorBlockJob *job, MirrorMethod method,
                          zero_bitmap_end - zero_bitmap_offset);
         }
         assert(!qiov);
-        ret = blk_co_pdiscard(job->target, offset, bytes);
+        ret = blk_co_pdiscard(job->target, offset, bytes, 0);
         break;
 
     default:
